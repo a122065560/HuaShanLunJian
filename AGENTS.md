@@ -79,7 +79,7 @@ git tag v1.x.x && git push origin v1.x.x
   - `Contents/Frameworks/playwright/driver/package/.local-browsers/`
 - 同时创建 `local-browsers`（不带点）符号链接 → `.local-browsers`，兼容 `PLAYWRIGHT_BROWSERS_PATH=0`
 - 运行时搜索顺序: 内置 Chromium → 自动下载 → 系统 Chrome（回退）
-- **hdiutil 被 TRAE 沙箱阻止**（无法访问 /dev/rdisk*），本地无法生成 .dmg
+- **hdiutil 在 TRAE 沙箱中可用**（之前被阻止，现已恢复正常，本地可生成 .dmg）
 - **MacBook 迁移后缓存丢失**: 迁移数据不会带走 `~/.huashanlunjian/` 目录，需重新下载 Chromium
 
 ## 配置系统
@@ -118,6 +118,6 @@ git tag v1.x.x && git push origin v1.x.x
 
 ## 版本规则
 - 当前最新: v1.2.0
-- 下一个 fix/feature: v1.1.1
+- 下一个 fix/feature: v1.2.1
 - **每次修改(修bug/新功能)后，默认只生成本地 .app**（不推送 GitHub）
 - **只有在用户明确说"发版"时，才需要推送到 GitHub Release**
