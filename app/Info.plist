@@ -3,19 +3,19 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>聚慧</string>
+    <string>话山论见</string>
     <key>CFBundleDisplayName</key>
-    <string>聚慧</string>
+    <string>话山论见</string>
     <key>CFBundleIdentifier</key>
-    <string>com.polysage.app</string>
+    <string>com.huashanlunjian.app</string>
     <key>CFBundleVersion</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
-    <string>聚慧</string>
+    <string>话山论见</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon.icns</string>
     <key>LSMinimumSystemVersion</key>

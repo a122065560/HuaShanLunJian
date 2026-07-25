@@ -7,8 +7,8 @@ macos_adapter - macOS 平台适配器实现
 - 进程树递归终止（kill -TERM → grace 秒超时 → kill -9）
 - 端口检测、锁文件清理、健康诊断
 
-聚慧（PolySage）在 macOS 上将数据存放于：
-    ~/Library/Application Support/PolySage
+话山论见（HuaShanLunJian）在 macOS 上将数据存放于：
+    ~/Library/Application Support/HuaShanLunJian
 
 进程管理优先使用 psutil；若环境未安装 psutil，自动回退到
 系统命令（pgrep / kill）方案，以保证模块始终可被 import。
@@ -80,8 +80,8 @@ class MacOSAdapter(PlatformAdapter):
         return "macOS"
 
     def app_data_dir(self) -> Path:
-        """应用数据目录：~/Library/Application Support/PolySage"""
-        return Path.home() / "Library" / "Application Support" / "PolySage"
+        """应用数据目录：~/Library/Application Support/HuaShanLunJian"""
+        return Path.home() / "Library" / "Application Support" / "HuaShanLunJian"
 
     def default_user_data_dir(self) -> Path:
         """Chrome 默认用户数据目录。"""

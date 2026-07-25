@@ -1,12 +1,12 @@
-# 聚慧 PolySage 产品技术规格说明书（AI 阅读版）
+# 话山论见 HuaShanLunJian 产品技术规格说明书（AI 阅读版）
 
-> 本文档面向 AI 模型/智能体阅读，旨在让 AI 在一次性阅读后完整理解 聚慧 PolySage 是什么工具、解决什么问题、有哪些功能、技术架构如何、核心逻辑怎样运转。
+> 本文档面向 AI 模型/智能体阅读，旨在让 AI 在一次性阅读后完整理解 话山论见 HuaShanLunJian 是什么工具、解决什么问题、有哪些功能、技术架构如何、核心逻辑怎样运转。
 
 ---
 
 ## 一、产品定位（一句话定义）
 
-**聚慧 PolySage 是一款 macOS 原生桌面应用，让用户在零 API Key 的前提下，通过 Playwright 自动化控制多个已登录的 AI 网页（如 DeepSeek、智谱清言等），围绕用户提出的复杂议题进行多 AI 自主协作讨论，最终产出结构化方案。**
+**话山论见 HuaShanLunJian 是一款 macOS 原生桌面应用，让用户在零 API Key 的前提下，通过 Playwright 自动化控制多个已登录的 AI 网页（如 DeepSeek、智谱清言等），围绕用户提出的复杂议题进行多 AI 自主协作讨论，最终产出结构化方案。**
 
 核心价值：
 - **无需任何 API Key**：直接控制浏览器中已登录的 AI 网页，复用用户的网页版会员权益
@@ -22,7 +22,7 @@
 | 平台 | macOS（Apple Silicon arm64），以 .dmg 安装包分发 |
 | 技术栈 | Python 3.9+ / PyQt6（GUI）/ Playwright（浏览器自动化）/ qasync（异步集成）|
 | 运行方式 | 双击 .app 启动，原生窗口，非 Web 应用 |
-| 数据存储 | 配置文件：`~/.polysage/config.json`；日志：`~/.polysage/logs/` |
+| 数据存储 | 配置文件：`~/.huashanlunjian/config.json`；日志：`~/.huashanlunjian/logs/` |
 | 外部依赖 | Chrome 浏览器（应用以调试模式启动并控制它）；LM Studio（可选，本地模型增强）|
 
 ---
@@ -177,7 +177,7 @@ ChromeManager
 {
   "chrome": {
     "debug_port": 9222,
-    "user_data_dir": "~/.polysage/chrome-data"
+    "user_data_dir": "~/.huashanlunjian/chrome-data"
   },
   "discussion": {
     "end_signal": "<End>",
@@ -402,8 +402,8 @@ async def resolve_arbitrator(arbitrator_name, history, last_reply, ai_a, ai_b, p
 
 ## 九、日志系统
 
-- **日志目录**：`~/.polysage/logs/`
-- **日志格式**：`polysage_YYYYMMDD.log`（按日期滚动）
+- **日志目录**：`~/.huashanlunjian/logs/`
+- **日志格式**：`huashanlunjian_YYYYMMDD.log`（按日期滚动）
 - **日志级别**：INFO / WARNING / ERROR
 - **日志内容**：
   - 用户操作（启动 Chrome、开始讨论、发送消息）
@@ -416,7 +416,7 @@ async def resolve_arbitrator(arbitrator_name, history, last_reply, ai_a, ai_b, p
 
 ## 十、与同类产品的区别
 
-| 特性 | 聚慧 PolySage | 普通 AI 聊天工具 | 多模型并答工具 |
+| 特性 | 话山论见 HuaShanLunJian | 普通 AI 聊天工具 | 多模型并答工具 |
 |------|---------------|-----------------|---------------|
 | API Key | 不需要 | 需要 | 需要 |
 | 多 AI 交互 | AI 之间真实对话 | 单一 AI | 并行独立回答 |
@@ -442,7 +442,7 @@ async def resolve_arbitrator(arbitrator_name, history, last_reply, ai_a, ai_b, p
 
 ## 十二、总结
 
-聚慧 PolySage 的本质是一个**多 AI 自主协作编排器**：
+话山论见 HuaShanLunJian 的本质是一个**多 AI 自主协作编排器**：
 
 1. **输入**：用户的复杂议题 + 选择的多个 AI 平台
 2. **处理**：通过浏览器自动化，让 AI 之间进行多轮真实对话，互相质疑、补充、推演

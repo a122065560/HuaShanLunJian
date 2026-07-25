@@ -344,12 +344,21 @@ class HostedMode:
                 if progress_callback and not fast_wait:
                     progress_callback("ai_speaking", ai["name"], "True")
 
-                reply = await self.chrome.send_and_wait(
+                # 用 Task 包装 send_and_wait，支持用户停止时快速中断
+                # 否则用户点"停止"后需等 180 秒超时才能退出
+                sw_task = asyncio.ensure_future(self.chrome.send_and_wait(
                     page, prompt, ai,
                     timeout=timeout, fast_wait=fast_wait,
                     force_file_upload=force_file_upload,
                     file_recently_uploaded=file_recently_uploaded
-                )
+                ))
+                while not sw_task.done():
+                    if self._stop_requested:
+                        sw_task.cancel()
+                        log_info(f"[{ai['name']}] 用户请求停止，中断 send_and_wait")
+                        raise Exception("用户请求停止讨论（STOP_REQUESTED）")
+                    await asyncio.sleep(0.5)
+                reply = sw_task.result()
 
                 # === 大脑后处理：思考过滤（不再做二次提取） ===
                 # 注意：之前这里有"大脑二次提取"逻辑，使用 reply_count_before=-1 提取所有容器
@@ -384,8 +393,31 @@ class HostedMode:
 
             except Exception as e:
                 error_msg = str(e)
-                is_page_error = ("closed" in error_msg.lower() or "target" in error_msg.lower()
-                                 or "页面" in error_msg or "page" in error_msg.lower())
+                # 精确匹配页面关闭/失效错误，避免 Playwright 操作超时（如 "page.click: Timeout"）
+                # 被误判为页面关闭，导致在旧页面上重发消息（开场白重复 bug 的根因）
+                page_closed_markers = [
+                    "target page, context or browser has been closed",
+                    "page has been closed",
+                    "target closed",
+                    "session closed",
+                    "browser has been closed",
+                    "context has been closed",
+                    "page已关闭",
+                    "页面已关闭",
+                    "页面已失效",
+                    "页面引用为空",
+                    "页面已关闭（target page",
+                ]
+                error_lower = error_msg.lower()
+                is_page_error = any(m in error_lower for m in page_closed_markers)
+
+                # 消息已发送但后续步骤（等待回复/提取回复）失败时，绝不重发
+                # 否则会在同一页面上重复发送开场白/话题，导致 AI 收到 N 份重复消息
+                if "MESSAGE_ALREADY_SENT" in error_msg:
+                    log_warning(f"[{ai['name']}] 消息已发送但后续步骤失败，不重发: {error_msg[:100]}")
+                    if progress_callback and not fast_wait:
+                        progress_callback("ai_speaking", ai["name"], "False")
+                    return None, Exception(f"{ai['name']} 消息已发送但提取回复失败")
 
                 # 检查浏览器是否仍然存活（区分"页面被关"和"浏览器整体被关"）
                 if is_page_error and not self.chrome.is_browser_alive():
@@ -777,13 +809,14 @@ class HostedMode:
                     )
                 )
             else:
-                # 后续轮：军师收到上一轮所有谋士的回复
+                # 后续轮：军师收到上一轮所有谋士的回复（过滤掉军师自己的发言，避免自己收到自己的回复）
+                replies_for_arbiter = [r for r in prev_round_replies if r["name"] != arb_ai["name"]]
                 arb_prompt = (
                     self._init_prefix(arb_ai, initialized, ai_list)
                     + build_arbiter_round_prompt(
                         my_name=arb_ai["name"],
                         topic=topic,
-                        prev_round_replies=prev_round_replies,
+                        prev_round_replies=replies_for_arbiter,
                         focal_points=focal_points,
                         round_num=round_count + 1,
                         end_signal=self.end_signal,
@@ -1206,12 +1239,14 @@ class HostedMode:
                     + f"\n请{arb_ai['name']}（军师）针对以上主公追问发表你的看法。"
                 )
             else:
+                # 追问后续轮：军师收到上一轮所有谋士的回复（过滤掉军师自己的发言）
+                replies_for_arbiter = [r for r in prev_round_replies if r["name"] != arb_ai["name"]]
                 arb_prompt = (
                     self._init_prefix(arb_ai, initialized, ai_list)
                     + build_arbiter_round_prompt(
                         my_name=arb_ai["name"],
                         topic=user_message,
-                        prev_round_replies=prev_round_replies,
+                        prev_round_replies=replies_for_arbiter,
                         focal_points=focal_points,
                         round_num=round_count + 1,
                         end_signal=self.end_signal,

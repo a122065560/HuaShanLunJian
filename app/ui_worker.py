@@ -94,13 +94,11 @@ class AIWorker:
             log_info(f"[AIWorker:{self.name}] 已停止")
 
     async def _check_status(self):
-        """统一检测 AI 就绪状态：对话框 + 登录 + 思考模式。
+        """统一检测 AI 就绪状态：只检测对话框 + 登录，不再检测思考模式。
 
         流程：
-        1. check_ai_ready（只读检测三个条件）
-        2. 如果橙色且原因是思考模式未开启 → try_enable_thinking_mode（操作）
-        3. 操作后重新 detect_thinking_mode 确认
-        4. 用户手动开启后，下次检测自动变绿（检测与操作独立）
+        1. check_ai_ready（只读检测两个条件：对话框存在 + 已登录）
+        2. 报告状态
         """
         # 讨论进行中时，已绿色的AI不再反复检测（防止波动）
         if self._discussion_active and self._last_status == "green":
@@ -125,7 +123,6 @@ class AIWorker:
                 )
                 if self.page:
                     log_info(f"[AIWorker:{self.name}] 页面重建成功")
-                    self.chrome_mgr.clear_thinking_cache(self.name)
                     await asyncio.sleep(3)
                 else:
                     self._last_status = "orange"
@@ -138,7 +135,7 @@ class AIWorker:
                 return
 
         try:
-            # 1. 统一检测（只读，不操作）—— 只检测对话框+登录，不检测思考模式
+            # 只检测对话框 + 登录状态，不检测/操作思考模式
             status, reason = await asyncio.wait_for(
                 self.chrome_mgr.check_ai_ready(self.page, self.config),
                 timeout=15
@@ -148,26 +145,7 @@ class AIWorker:
                 log_ai(self.name, f"状态变更: {self._last_status}→{status} ({reason})")
             log_ai(self.name, f"检测: {status} ({reason})", "debug")
 
-            # 2. 如果已就绪（绿色），后台尝试启用思考模式（不影响绿色状态）
-            if status == "green":
-                tm = self.config.get("thinking_mode", {})
-                if tm.get("enabled", False):
-                    # 后台尝试启用思考模式（操作），失败不影响绿色状态
-                    try:
-                        is_active, _ = await asyncio.wait_for(
-                            self.chrome_mgr.detect_thinking_mode(self.page, self.config),
-                            timeout=8
-                        )
-                        if not is_active:
-                            # 尝试启用（操作）
-                            await asyncio.wait_for(
-                                self.chrome_mgr.try_enable_thinking_mode(self.page, self.config),
-                                timeout=10
-                            )
-                    except Exception:
-                        pass  # 思考模式启用失败不影响就绪状态
-
-            # 3. 报告状态
+            # 报告状态
             self._last_status = status
             await self.brain_queue.put(("status", self.name, status, reason))
 
@@ -558,6 +536,8 @@ class WorkerThread(QThread):
         """在工作线程中停止讨论。"""
         if self._hosted:
             self._hosted._stop_requested = True
+            self._hosted._is_running = False
+            log_info("讨论已停止（_stop_requested=True, _is_running=False）")
 
     def do_clear_history(self):
         """清除讨论历史 — 主线程只发命令，大脑线程执行。"""

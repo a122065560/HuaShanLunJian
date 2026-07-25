@@ -2149,7 +2149,7 @@ class HostedModeTab(QWidget):
 # ======================================================================
 
 class MainWindow(QMainWindow):
-    """聚慧 PolySage 主窗口。"""
+    """话山论见 HuaShanLunJian 主窗口。"""
 
     # 信号：用于线程安全的 UI 更新
     status_message = pyqtSignal(str, int)  # (message, timeout_ms)
@@ -2168,7 +2168,7 @@ class MainWindow(QMainWindow):
         self._arbitrator = self.config_mgr.config.get("discussion", {}).get("arbitrator", "智谱清言")
         # 先创建 chrome_mgr 占位（_build_ui 中 HostedModeTab 需要引用）
         self.chrome_mgr = ChromeManager(self.config_mgr.config)
-        self.setWindowTitle("聚慧")
+        self.setWindowTitle("话山论见")
         # 设置窗口图标
         _icon_path = resource_path("logo_ui.png")
         if os.path.exists(_icon_path):
@@ -3285,6 +3285,12 @@ class MainWindow(QMainWindow):
 
     def _on_clear(self):
         """清空讨论记录，同时开启新对话 — 主线程只发命令。"""
+        # 先停止当前讨论（防止讨论进行中清空导致状态冲突）
+        if self.worker and self.worker._hosted:
+            if self.worker._hosted.is_running():
+                self.worker.do_stop_discussion()
+                self._discussion_running = False
+                self._show_toast("已停止当前讨论，正在清空记录...")
         # 清空托管模式 Tab（UI操作，主线程做）
         self.hosted_tab._on_clear()
         # 清除文件
@@ -3336,15 +3342,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("✅ 全部对话已复制到剪贴板", 3000)
 
     def _on_save_conversation(self):
-        """将对话内容保存至本地文件，默认文件名为 聚慧_日期时间。"""
+        """将对话内容保存至本地文件，默认文件名为 话山论见_日期时间。"""
         text = self.hosted_tab.chat_stream.get_all_text()
 
         if not text.strip():
             self.statusBar().showMessage("没有对话内容可保存", 3000)
             return
 
-        # 默认文件名：聚慧_YYYYMMDD_HHMMSS.txt
-        default_name = f"聚慧_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        # 默认文件名：话山论见_YYYYMMDD_HHMMSS.txt
+        default_name = f"话山论见_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         default_path = os.path.join(os.path.expanduser("~"), "Desktop", default_name)
 
         file_path, _ = QFileDialog.getSaveFileName(

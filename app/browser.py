@@ -10,6 +10,7 @@ ChromeManager：启动调试模式 Chrome、Playwright CDP 连接、
 import asyncio
 import os
 import platform
+import re
 import socket
 import sys
 from typing import Optional
@@ -143,9 +144,9 @@ class ChromeManager:
     # ------------------------------------------------------------------
 
     # LaunchAgent 标识（用于通过 launchd 启动/停止 Chrome）
-    _LAUNCH_AGENT_LABEL = "com.polysage.chrome"
+    _LAUNCH_AGENT_LABEL = "com.huashanlunjian.chrome"
     _LAUNCH_AGENT_PLIST = os.path.expanduser(
-        "~/Library/LaunchAgents/com.polysage.chrome.plist"
+        "~/Library/LaunchAgents/com.huashanlunjian.chrome.plist"
     )
 
     async def start_chrome_debug_async(self) -> tuple:
@@ -177,7 +178,7 @@ class ChromeManager:
         if user_data_dir:
             user_data_dir = os.path.expanduser(user_data_dir)
         else:
-            user_data_dir = os.path.expanduser("~/.polysage/chrome-data")
+            user_data_dir = os.path.expanduser("~/.huashanlunjian/chrome-data")
 
         # 端口已占用时，浏览器可能已在运行
         if is_port_in_use(port):
@@ -226,27 +227,30 @@ class ChromeManager:
                 ]
                 system_caches = [
                     os.path.expanduser("~/Library/Caches/ms-playwright"),
-                    os.path.join(os.path.expanduser("~/Library/Caches/PolySage"), "browsers"),
+                    os.path.join(os.path.expanduser("~/Library/Caches/HuaShanLunJian"), "browsers"),
                 ]
             elif sys.platform == 'win32':
                 subpaths = ["chrome-win64/chrome.exe"]
                 _la = os.environ.get("LOCALAPPDATA", "")
                 system_caches = [
                     os.path.join(_la, "ms-playwright"),
-                    os.path.join(_la, "PolySage", "browsers"),
+                    os.path.join(_la, "HuaShanLunJian", "browsers"),
                 ]
             else:
                 subpaths = ["chrome-linux/chrome"]
                 system_caches = [
                     os.path.expanduser("~/.cache/ms-playwright"),
-                    os.path.join(os.path.expanduser("~/.cache/PolySage"), "browsers"),
+                    os.path.join(os.path.expanduser("~/.cache/HuaShanLunJian"), "browsers"),
                 ]
 
             # 1. PyInstaller 打包环境：查找 _MEIPASS 内的 Chromium
+            #    同时搜索 .local-browsers（带点，build_dmg.sh 复制位置）
+            #    和 local-browsers（不带点，PLAYWRIGHT_BROWSERS_PATH=0 默认位置）
             if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
                 meipass = Path(sys._MEIPASS)
                 for bd in [
                     meipass / 'playwright' / 'driver' / 'package' / '.local-browsers',
+                    meipass / 'playwright' / 'driver' / 'package' / 'local-browsers',
                     meipass / '.local-browsers',
                 ]:
                     result = _search_in_dir(bd, subpaths)
@@ -257,8 +261,13 @@ class ChromeManager:
             exe_dir = Path(sys.executable).parent
             for rel in [
                 '_internal/playwright/driver/package/.local-browsers',
+                '_internal/playwright/driver/package/local-browsers',
                 'playwright/driver/package/.local-browsers',
+                'playwright/driver/package/local-browsers',
                 'Frameworks/playwright/driver/package/.local-browsers',
+                'Frameworks/playwright/driver/package/local-browsers',
+                'Resources/playwright/driver/package/.local-browsers',
+                'Resources/playwright/driver/package/local-browsers',
             ]:
                 result = _search_in_dir(exe_dir / rel, subpaths)
                 if result:
@@ -278,11 +287,11 @@ class ChromeManager:
 
             # 确定用户可写的下载目录
             if sys.platform == 'win32':
-                dl_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "PolySage", "browsers")
+                dl_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "HuaShanLunJian", "browsers")
             elif sys.platform == 'darwin':
-                dl_dir = os.path.expanduser("~/Library/Caches/PolySage/browsers")
+                dl_dir = os.path.expanduser("~/Library/Caches/HuaShanLunJian/browsers")
             else:
-                dl_dir = os.path.expanduser("~/.cache/PolySage/browsers")
+                dl_dir = os.path.expanduser("~/.cache/HuaShanLunJian/browsers")
             os.makedirs(dl_dir, exist_ok=True)
 
             # 查找 Playwright driver（node + cli.js）
@@ -325,13 +334,26 @@ class ChromeManager:
         if not chromium_exe:
             chromium_exe = _try_download_chromium()
 
+        # 仍未找到内置 Chromium 时，回退到系统 Chrome（用户已安装的 Google Chrome）
+        # 这样即使打包时未包含 Chromium，内置浏览器也能正常工作
+        if not chromium_exe:
+            chromium_exe = _find_system_chrome()
+            if chromium_exe:
+                log_info(f"未找到内置 Chromium，回退到系统 Chrome: {chromium_exe}")
+            else:
+                log_warning("未找到内置 Chromium，也未找到系统 Chrome，Playwright 将使用默认路径（可能失败）")
+
         # 设置 Playwright 浏览器搜索路径（打包环境：使用包内浏览器）
+        # PLAYWRIGHT_BROWSERS_PATH=0 让 Playwright 在 driver/package/local-browsers 查找
+        # 同时检查 .local-browsers（带点）和 local-browsers（不带点）两种命名
         if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
-            bundle_browsers = os.path.join(
-                sys._MEIPASS, 'playwright', 'driver', 'package', '.local-browsers'
-            )
-            if os.path.isdir(bundle_browsers):
-                os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '0'
+            for bdir_name in ['.local-browsers', 'local-browsers']:
+                bundle_browsers = os.path.join(
+                    sys._MEIPASS, 'playwright', 'driver', 'package', bdir_name
+                )
+                if os.path.isdir(bundle_browsers):
+                    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '0'
+                    break
 
         try:
             if self._playwright is None:
@@ -402,7 +424,7 @@ class ChromeManager:
         if user_data_dir:
             user_data_dir = os.path.expanduser(user_data_dir)
         else:
-            user_data_dir = os.path.expanduser("~/.polysage/chrome-data")
+            user_data_dir = os.path.expanduser("~/.huashanlunjian/chrome-data")
 
         # 端口已占用时，可能 Chrome 已在运行
         if is_port_in_use(port):
@@ -823,7 +845,7 @@ class ChromeManager:
             if sys.platform == 'darwin':
                 # macOS: osascript
                 proc = await asyncio.create_subprocess_exec(
-                    "osascript", "-e", 'tell application "聚慧" to activate',
+                    "osascript", "-e", 'tell application "话山论见" to activate',
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -1021,6 +1043,9 @@ class ChromeManager:
 
         timeout_ms = timeout * 1000
         ai_name = ai_config.get("name", "未知")
+        # 标记消息是否已成功发送到聊天框（用于区分"发送前失败"和"发送后失败"）
+        # 发送后失败时不应重发消息，否则会导致开场白重复
+        message_sent = False
 
         # 检查页面是否已关闭，如果关闭则尝试重新获取
         try:
@@ -1051,30 +1076,92 @@ class ChromeManager:
                     raise Exception(f"页面不可用且重新获取失败: {e2}")
 
         try:
-            # 0.5 记录发送前的状态（页面内容长度 + 回复区块数）
+            # 0.5 记录发送前的状态（页面内容长度 + 回复区块数 + 复制按钮数）
             state_before = await page.evaluate("""() => {
                 const selectors = '.ds-markdown--content, div[class*="message-content"], div[class*="markdown-body"], div[class*="message__content"], div[class*="answer-content"], div[class*="reply-content"], div[class*="bubble"], div[data-role="assistant"]';
                 const els = document.querySelectorAll(selectors);
+
+                // 统计复制按钮数量（多策略，覆盖所有6个AI平台）
+                function countCopyButtons() {
+                    const found = new Set();
+                    // 策略1: aria-label 含"复制"/"copy"
+                    document.querySelectorAll('[aria-label]').forEach(el => {
+                        const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                        if (label === '复制' || label === 'copy' || label.includes('复制') || label.includes('copy')) {
+                            if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                                found.add(el);
+                            }
+                        }
+                    });
+                    // 策略2: 文字"复制"的按钮
+                    document.querySelectorAll('button, [role="button"], [class*="icon-button"], [class*="action"]').forEach(el => {
+                        const text = (el.textContent || '').trim();
+                        if (text === '复制' || text === 'Copy') {
+                            found.add(el);
+                        }
+                    });
+                    // 策略3: class 含"copy"
+                    document.querySelectorAll('[class*="copy" i]').forEach(el => {
+                        if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                            found.add(el);
+                        }
+                    });
+                    // 策略4: 回复区块底部工具栏的第一个按钮（豆包/DeepSeek 等无文字标识的平台）
+                    const footerSelectors = [
+                        '.ds-markdown--footer',
+                        '[class*="message-action-bar"]',
+                        '[class*="message-footer"]',
+                        '[class*="answer-footer"]',
+                        '[class*="segment-assistant-actions"]',
+                        '[class*="chat-action"]',
+                        '[class*="msg-action"]',
+                        '[class*="reply-action"]',
+                        '[class*="footer-action"]',
+                    ];
+                    footerSelectors.forEach(sel => {
+                        try {
+                            document.querySelectorAll(sel).forEach(bar => {
+                                const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"]');
+                                if (btns.length > 0) {
+                                    // 取第一个按钮作为复制按钮（排除"朗读"）
+                                    for (const btn of btns) {
+                                        const aria = (btn.getAttribute('aria-label') || '').trim();
+                                        const text = (btn.textContent || '').trim();
+                                        if (aria !== '朗读' && aria !== 'Read aloud' && text !== '朗读') {
+                                            found.add(btn);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        } catch(e) {}
+                    });
+                    return found.size;
+                }
+
                 return {
                     count: els.length,
-                    content_len: document.body.innerText.length
+                    content_len: document.body.innerText.length,
+                    copy_btn_count: countCopyButtons(),
                 };
             }""")
             reply_count_before = state_before.get("count", 0)
             content_len_before = state_before.get("content_len", 0)
-            log_info(f"[{ai_name}] 发送前状态: 回复区块={reply_count_before}, 内容长度={content_len_before}")
+            copy_btn_count_before = state_before.get("copy_btn_count", 0)
+            log_info(f"[{ai_name}] 发送前状态: 回复区块={reply_count_before}, 内容长度={content_len_before}, 复制按钮={copy_btn_count_before}")
 
             # 1. 定位输入框并填充（带重试，粘贴文件后页面可能重渲染）
-            # 统一策略：7000字以下全文字，7000字以上前7000字文字+超出部分转txt文件
-            TEXT_THRESHOLD = 7000
+            # 统一策略：20字以内直接逐字输入，20字以上前20字逐字输入+剩余转txt文件
+            # 避免粘贴操作导致千问 Slate.js 等框架异常
+            TEXT_HEAD_LEN = 20  # 前20字逐字键盘输入
 
             file_content = None      # 写入txt文件的内容（None=不上传文件）
             text_after_upload = message  # 文件上传后发送的文字消息（默认=原始消息）
 
-            if len(message) > TEXT_THRESHOLD:
-                # 超过7000字：前7000字文字 + 超出部分转txt文件
-                file_content = message[TEXT_THRESHOLD:]
-                text_after_upload = message[:TEXT_THRESHOLD] + "\n\n[后续内容请见上传的文件]"
+            if len(message) > TEXT_HEAD_LEN:
+                # 超过20字：前20字逐字输入 + 剩余部分转txt文件
+                file_content = message[TEXT_HEAD_LEN:]
+                text_after_upload = message[:TEXT_HEAD_LEN] + "\n\n[后续内容请见上传的文件]"
 
             # 向后兼容：force_file_upload 参数（强制全部转文件）
             if force_file_upload:
@@ -1082,16 +1169,16 @@ class ChromeManager:
                 text_after_upload = "请先阅读上传的文件内容，然后根据文件中的内容进行回复。"
 
             need_file_upload = file_content is not None
-            file_just_uploaded = False  # 标记刚上传了文件，需要用剪贴板粘贴而非 execCommand
+            file_just_uploaded = False  # 标记刚上传了文件，需要用 keyboard.type 而非 execCommand
             if need_file_upload:
                 import time as _time_for_file
                 if force_file_upload:
                     log_info(f"[{ai_name}] 强制文件上传模式")
                 else:
-                    log_info(f"[{ai_name}] 消息{len(message)}字 > {TEXT_THRESHOLD}字，前{TEXT_THRESHOLD}字文字 + 剩余{len(file_content)}字转文件")
+                    log_info(f"[{ai_name}] 消息{len(message)}字 > {TEXT_HEAD_LEN}字，前{TEXT_HEAD_LEN}字逐字输入 + 剩余{len(file_content)}字转文件")
                 import os
                 # 创建临时txt文件
-                tmp_dir = os.path.expanduser("~/.polysage/temp")
+                tmp_dir = os.path.expanduser("~/.huashanlunjian/temp")
                 os.makedirs(tmp_dir, exist_ok=True)
                 tmp_file = os.path.join(tmp_dir, f"prompt_{ai_name}_{int(_time_for_file.time())}.txt")
                 with open(tmp_file, "w", encoding="utf-8") as f:
@@ -1141,7 +1228,7 @@ class ChromeManager:
                         await page.keyboard.press("Control+A")
                         await page.keyboard.press("Delete")
                         await page.wait_for_timeout(200)
-                        # 混合输入：粘贴大部分 + 打字尾部（比纯打字快 50 倍）
+                        # 三段式混合输入：前5字慢输入 + 中间粘贴 + 后5字慢输入（比纯打字快 50 倍）
                         await input_el.click()
                         await page.wait_for_timeout(200)
                         hybrid_ok = await self._type_message(page, message, delay=2, ai_name=ai_name)
@@ -1163,7 +1250,7 @@ class ChromeManager:
                         await page.wait_for_timeout(800)
                         # 验证发送按钮是否已激活
                         btn_active = await page.evaluate("""() => {
-                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"]');
+                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"], div.send-btn-wrapper button[type="submit"]');
                             if (btn) {
                                 if (btn.disabled) return false;
                                 if (btn.className && btn.className.includes('empty')) return false;
@@ -1224,7 +1311,7 @@ class ChromeManager:
                         # 最终检查：如果按钮仍灰色，不再清空输入框
                         # 保留文字内容，继续尝试发送（_click_send_button 有多种发送策略）
                         final_check = await page.evaluate("""() => {
-                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"]');
+                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"], div.send-btn-wrapper button[type="submit"]');
                             if (btn) {
                                 if (btn.disabled) return false;
                                 if (btn.className && btn.className.includes('empty')) return false;
@@ -1289,7 +1376,7 @@ class ChromeManager:
                         state_ok = await page.evaluate("""() => {
                             // 注意：button:has-text() 是 Playwright 专有选择器，不能用在 document.querySelector 中
                             // 只使用标准 CSS 选择器
-                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"]');
+                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], div.send-btn-wrapper button[type="submit"]');
                             if (btn) {
                                 if (btn.disabled) return false;  // 按钮仍为 disabled，框架未同步
                                 if (btn.className && btn.className.includes('empty')) return false;
@@ -1312,7 +1399,7 @@ class ChromeManager:
                             await page.keyboard.press("Control+A")
                             await page.keyboard.press("Delete")
                             await page.wait_for_timeout(200)
-                            # 混合输入：粘贴大部分 + 打字尾部（比纯打字快 50 倍）
+                            # 三段式混合输入：前5字慢输入 + 中间粘贴 + 后5字慢输入（比纯打字快 50 倍）
                             await input_el.click()
                             await page.wait_for_timeout(200)
                             hybrid_ok = await self._type_message(page, message, delay=2, ai_name=ai_name)
@@ -1334,7 +1421,7 @@ class ChromeManager:
                             await page.wait_for_timeout(800)
                             # 验证发送按钮是否已激活
                             btn_active = await page.evaluate("""() => {
-                                const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"]');
+                                const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"], div.send-btn-wrapper button[type="submit"]');
                                 if (btn) {
                                     if (btn.disabled) return false;
                                     if (btn.className && btn.className.includes('empty')) return false;
@@ -1422,6 +1509,9 @@ class ChromeManager:
 
             log_info(f"[{ai_name}] 消息已发送，等待回复...")
 
+            # 标记消息已成功发送，后续提取失败不应触发重发
+            message_sent = True
+
             # 记录对话状态（用于验证提取的回复）
             import time as _time
             self._last_sent_to[ai_name] = {
@@ -1444,7 +1534,7 @@ class ChromeManager:
                     content_len_before = content_len_after_send
             except Exception:
                 pass
-            await self._wait_for_reply_complete(page, stop_selector, timeout_ms, reply_count_before, content_len_before, message, fast_wait)
+            await self._wait_for_reply_complete(page, stop_selector, timeout_ms, reply_count_before, content_len_before, message, fast_wait, copy_btn_count_before, ai_name)
 
             # 5. 提取最新回复，带验证重试
             # 重试次数和间隔根据剩余超时时间动态计算，不超过配置的 timeout_seconds
@@ -1575,7 +1665,7 @@ class ChromeManager:
                     log_warning(f"[{ai_name}] 提取到分段UI标签({reply_text[:30]})，重试 {retry+1}/{max_retries}...")
                     await asyncio.sleep(retry_interval)
                     continue
-                # 验证：回复不能是文件附件标签（如"PolySage_技术文档.txt 36KB"）
+                # 验证：回复不能是文件附件标签（如"HuaShanLunJian_技术文档.txt 36KB"）
                 if _re.match(r'^[\w\u4e00-\u9fff\-_.]+\.(txt|md|csv|pdf|docx?|xlsx?|pptx?|zip|rar)\s*\n?\s*\d*(KB|MB|GB|B)?\s*$', reply_text.strip(), _re.IGNORECASE):
                     log_warning(f"[{ai_name}] 提取到文件附件标签({reply_text[:30]})，重试 {retry+1}/{max_retries}...")
                     await asyncio.sleep(retry_interval)
@@ -1668,10 +1758,14 @@ class ChromeManager:
             return reply_text
 
         except TimeoutError:
-            raise
+            # 超时时消息可能已发送，附加标记防止 _send_to 重发
+            raise Exception(f"发送消息失败（超时）: {ai_name} {'MESSAGE_ALREADY_SENT' if message_sent else ''}")
         except Exception as e:
             log_exception(f"[{ai_name}] 发送消息失败", type(e), e, e.__traceback__)
-            raise Exception(f"发送消息失败: {e}")
+            # 消息已发送但后续步骤失败时，附加标记防止 _send_to 在旧页面上重发
+            # 这修复了开场白被重复发送 N 次的 bug
+            sent_flag = "MESSAGE_ALREADY_SENT" if message_sent else ""
+            raise Exception(f"发送消息失败: {e} {sent_flag}")
 
     async def _upload_file(self, page: Page, file_path: str, ai_name: str):
         """上传文件到 AI 平台。
@@ -1909,76 +2003,33 @@ class ChromeManager:
     async def _type_message(self, page: Page, message: str, delay: int = 2,
                             ai_name: str = "") -> bool:
         """
-        混合输入消息：execCommand 粘贴大部分 + keyboard.type 尾部打字。
+        纯逐字键盘输入消息（不使用粘贴，避免千问 Slate.js 等框架异常）。
 
         策略：
-        1. execCommand('insertText') 粘贴全部文字（快速，瞬间完成）
-        2. 删除尾部少量字符，再用 keyboard.type 重新输入（触发框架状态更新）
-        3. 键盘事件触发后，框架（Slate.js 等）读取 DOM 完整内容并更新内部状态
-        4. 发送按钮激活
+        1. 用 keyboard.type 逐个输入所有字符（触发框架状态更新）
+        2. 发送按钮激活
 
-        比纯 keyboard.type 快 50-100 倍：
-        - 1000字消息：纯打字 20秒（delay=20ms），混合方式 <0.5秒
+        由于消息已在 send_and_wait 中被拆分为前20字+txt文件，
+        此处收到的消息通常不超过50字，逐字输入很快。
 
         Args:
             page: Playwright Page
-            message: 要输入的消息文本
-            delay: 尾部打字时每个字符的延迟（毫秒），默认 2ms
+            message: 要输入的消息文本（通常为前20字+提示语）
+            delay: 打字时每个字符的延迟（毫秒），默认 2ms
             ai_name: AI 名称（日志用）
 
         Returns:
-            bool: True 表示输入成功，False 表示 execCommand 失败需回退
+            bool: True 表示输入成功
         """
-        # 短消息（<=30字）：直接用键盘输入，无需混合
-        if len(message) <= 30:
-            lines = message.split('\n')
-            for i, line in enumerate(lines):
-                if i > 0:
-                    await page.keyboard.press("Shift+Enter")
-                    await page.wait_for_timeout(30)
-                if line:
-                    await page.keyboard.type(line, delay=delay)
-            return True
-
-        # 长消息：混合模式（粘贴大部分 + 打字尾部）
-        TAIL_LEN = min(5, len(message))  # 尾部打字 5 个字符
-        bulk = message[:-TAIL_LEN] if TAIL_LEN > 0 else message
-        tail = message[-TAIL_LEN:] if TAIL_LEN > 0 else ""
-
-        # 步骤1：execCommand 粘贴大部分文字（快速）
-        inserted = await page.evaluate("""(msg) => {
-            const el = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
-            if (!el) return false;
-            el.focus();
-            try {
-                return document.execCommand('insertText', false, msg);
-            } catch(e) {
-                return false;
-            }
-        }""", bulk)
-
-        if not inserted:
-            # execCommand 失败，返回 False 让调用方回退到纯键盘输入
-            log_warning(f"[{ai_name}] execCommand 粘贴失败，回退到纯键盘输入")
-            return False
-
-        # 步骤2：删除尾部 TAIL_LEN 个字符，再用键盘重新输入
-        # 这会触发框架的 input 事件链，使 Slate.js 等框架读取 DOM 并更新内部状态
-        await page.wait_for_timeout(100)
-        for _ in range(TAIL_LEN):
-            await page.keyboard.press("Backspace")
-            await page.wait_for_timeout(10)
-        await page.wait_for_timeout(50)
-
-        # 步骤3：用键盘输入尾部字符（触发框架状态更新）
-        for char in tail:
-            if char == '\n':
+        lines = message.split('\n')
+        for i, line in enumerate(lines):
+            if i > 0:
                 await page.keyboard.press("Shift+Enter")
                 await page.wait_for_timeout(30)
-            else:
-                await page.keyboard.type(char, delay=delay)
+            if line:
+                await page.keyboard.type(line, delay=delay)
 
-        log_info(f"[{ai_name}] 混合输入完成（粘贴 {len(bulk)} 字 + 打字 {len(tail)} 字，共 {len(message)} 字）")
+        log_info(f"[{ai_name}] 逐字键盘输入完成（{len(message)}字）")
         return True
 
     async def _click_send_button(self, page: Page, config_selector: str,
@@ -2230,18 +2281,86 @@ class ChromeManager:
         log_warning(f"[{ai_name}] {method} 后无变化(输入框={len(after_text)}字, 页面={after_body_len})")
         return False
 
+    def _is_sent_message_content(self, content: str, sent_message: str = "") -> bool:
+        """检查复制按钮关联的内容是否属于"发送的消息"（而非AI回复）。
+
+        核心策略（用户方案）：直接与发送的消息文本对比。
+        1. 计算网页上实际显示的文本（处理20字截断+文件引用）
+        2. 归一化后比较前30字指纹
+        3. 模式匹配作为辅助兜底
+
+        原理：发送消息后，用户消息会产生复制按钮。
+        如果最后一个复制按钮的内容 = 发送的消息 → AI还没回复
+        如果最后一个复制按钮的内容 ≠ 发送的消息 → AI已回复
+        """
+        if not content:
+            # 内容为空，无法判断，返回 False 表示"不是发送消息"
+            # 调用方应检查 last_content 是否为空，为空时不做判断
+            return False
+
+        # ---- 核心策略：直接对比发送的消息文本 ----
+        if sent_message:
+            # sent_message 已经是实际输入到浏览器的文本（即网页上显示的文本）
+            # send_and_wait 中：文件上传成功后 message 会被重赋值为 text_after_upload
+            # （前20字 + "[后续内容请见上传的文件]"），文件上传失败则发送完整原文
+            # 所以无需再次截断，直接用 sent_message 作为 displayed_text
+            displayed_text = sent_message
+
+            # 归一化：去除所有空白和换行，只比较实际文字内容
+            def _normalize(s: str) -> str:
+                return re.sub(r'\s+', '', s).strip()
+
+            content_norm = _normalize(content[:300])  # 取前300字足够比较
+            displayed_norm = _normalize(displayed_text[:300])
+
+            if displayed_norm:
+                # 取前30字作为指纹（比原来15字更可靠）
+                fingerprint = displayed_norm[:30]
+                if fingerprint and content_norm.startswith(fingerprint):
+                    return True
+                # 反向检查：发送消息是否以内容开头（内容可能被网页截断）
+                content_fp = content_norm[:30]
+                if content_fp and len(content_fp) >= 10 and displayed_norm.startswith(content_fp):
+                    return True
+
+        # ---- 辅助：模式匹配（处理特殊情况） ----
+        head = content[:100]
+        # 轮次发言标记 【第X轮 - 军师/谋士发言】
+        if re.search(r'【第\d+轮\s*-\s*(军师|谋士)发言】', head):
+            return True
+        # 规则标记
+        if '【规则】' in head[:50]:
+            return True
+        # 主公消息
+        if head.startswith('主公：') or head.startswith('主公:') or head.startswith('主公补充：'):
+            return True
+        # 系统通知
+        if head.startswith('【系统通知】'):
+            return True
+        # 讨论话题/回复标记
+        if head.startswith('【讨论话题】') or head.startswith('【讨论回复】'):
+            return True
+
+        return False
+
     async def _wait_for_reply_complete(self, page: Page, stop_selector: str,
                                        timeout_ms: int, reply_count_before: int = -1,
                                        content_len_before: int = 0,
                                        sent_message: str = "",
-                                       fast_wait: bool = False):
+                                       fast_wait: bool = False,
+                                       copy_btn_count_before: int = 0,
+                                       ai_name: str = ""):
         """
-        等待 AI 回复完成（纯内容增长检测，不依赖停止按钮）。
+        等待 AI 回复完成。
+
+        优先策略：复制按钮计数检测（AI回复完成后会新增复制按钮，比内容稳定检测快很多）。
+        回退策略：内容增长 + 稳定检测（连续N秒无变化）。
 
         流程：
         1. 强制最小等待（确保AI有时间开始回复）
-        2. 等待内容开始增长（AI开始输出，包括思考过程）
-        3. 持续监测内容增长，直到连续N秒无变化（AI输出完成）
+        2. 优先用复制按钮检测：每1秒扫描，复制按钮数量增加 → 回复完成
+        3. 回退到内容增长检测：等待内容开始增长
+        4. 回退到内容稳定检测：持续监测直到连续N秒无变化
 
         fast_wait=True 时使用更短的等待时间（用于简短确认回复如"ok"）。
         """
@@ -2250,19 +2369,195 @@ class ChromeManager:
         deadline = time.time() + (timeout_ms / 1000)
         sent_len = len(sent_message)
 
-        # 步骤1: 强制等待（fast_wait 模式 0.3 秒，正常 1 秒）
-        min_wait = 0.3 if fast_wait else 1
+        # 统计复制按钮数量 + 最后一个复制按钮内容头部的JS函数
+        # 用于内容感知检测：区分"发送消息的复制按钮"和"AI回复的复制按钮"
+        COUNT_COPY_BTN_WITH_CONTENT_JS = """() => {
+            const found = [];
+            // 策略1: aria-label 含"复制"/"copy"
+            document.querySelectorAll('[aria-label]').forEach(el => {
+                const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                if (label === '复制' || label === 'copy' || label.includes('复制') || label.includes('copy')) {
+                    if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                        found.push(el);
+                    }
+                }
+            });
+            // 策略2: 文字"复制"的按钮
+            document.querySelectorAll('button, [role="button"], [class*="icon-button"], [class*="action"]').forEach(el => {
+                const text = (el.textContent || '').trim();
+                if (text === '复制' || text === 'Copy') {
+                    found.push(el);
+                }
+            });
+            // 策略3: class 含"copy"
+            document.querySelectorAll('[class*="copy" i]').forEach(el => {
+                if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                    found.push(el);
+                }
+            });
+            // 策略4: 回复区块底部工具栏的第一个按钮
+            const footerSelectors = [
+                '.ds-markdown--footer',
+                '[class*="message-action-bar"]',
+                '[class*="message-footer"]',
+                '[class*="answer-footer"]',
+                '[class*="segment-assistant-actions"]',
+                '[class*="chat-action"]',
+                '[class*="msg-action"]',
+                '[class*="reply-action"]',
+                '[class*="footer-action"]',
+            ];
+            footerSelectors.forEach(sel => {
+                try {
+                    document.querySelectorAll(sel).forEach(bar => {
+                        const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"]');
+                        if (btns.length > 0) {
+                            for (const btn of btns) {
+                                const aria = (btn.getAttribute('aria-label') || '').trim();
+                                const text = (btn.textContent || '').trim();
+                                if (aria !== '朗读' && aria !== 'Read aloud' && text !== '朗读') {
+                                    found.push(btn);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                } catch(e) {}
+            });
+            // 去重并按DOM顺序排序
+            const unique = [];
+            const seen = new Set();
+            found.forEach(el => {
+                if (!seen.has(el)) { seen.add(el); unique.push(el); }
+            });
+            unique.sort((a, b) => {
+                if (a === b) return 0;
+                const pos = a.compareDocumentPosition(b);
+                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                return 0;
+            });
+            // 获取最后一个复制按钮关联的消息内容头部
+            // 改进：优先在复制按钮附近查找AI回复内容容器，避免获取到用户消息内容
+            let lastContent = '';
+            if (unique.length > 0) {
+                const lastBtn = unique[unique.length - 1];
+                // 策略A: 优先查找复制按钮所在消息块内的AI回复内容容器
+                // 这些选择器匹配各平台的AI回复内容区域（不含用户消息）
+                const replySelectors = [
+                    '.ds-markdown--content',
+                    'div[class*="markdown-body"]',
+                    'div[class*="message-content"]',
+                    'div[class*="answer-content"]',
+                    'div[class*="reply-content"]',
+                    'div[class*="bubble-content"]',
+                    'div[class*="markdown"]:not([class*="think"])',
+                    'div[class*="bubble"]:not([class*="think"])',
+                    'div[data-role="assistant"]',
+                    'div[class*="prose"]',
+                ];
+                let el = lastBtn;
+                for (let i = 0; i < 15; i++) {
+                    if (!el) break;
+                    // 在当前层级查找AI回复内容容器
+                    for (const sel of replySelectors) {
+                        try {
+                            const replyEl = el.querySelector(sel);
+                            if (replyEl) {
+                                const text = replyEl.innerText || '';
+                                if (text.length > 10) {
+                                    lastContent = text.substring(0, 150);
+                                    break;
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    if (lastContent) break;
+                    el = el.parentElement;
+                }
+                // 策略B: 回退到原来的逻辑（向上遍历找第一个有文字的父级）
+                if (!lastContent) {
+                    el = lastBtn;
+                    for (let i = 0; i < 15; i++) {
+                        el = el.parentElement;
+                        if (!el) break;
+                        const text = el.innerText || '';
+                        if (text.length > 10) {
+                            lastContent = text.substring(0, 150);
+                            break;
+                        }
+                    }
+                }
+            }
+            return { count: unique.length, last_content: lastContent };
+        }"""
+
+        # 步骤1: 强制等待（fast_wait 模式 0.3 秒，正常 0.5 秒）
+        min_wait = 0.3 if fast_wait else 0.5
         log_info(f"强制等待 {min_wait} 秒...")
         await asyncio.sleep(min_wait)
 
-        # 步骤2: 等待内容开始增长（AI开始输出，包括思考过程）
+        # 步骤2: 优先用复制按钮+内容感知检测（每0.5秒扫描一次）
+        # 核心优化：不仅检查复制按钮数量增加，还检查最后一个复制按钮的内容
+        # 如果内容是"发送的消息"（如【第X轮 - 谋士发言】），说明是工具消息的复制按钮，继续等待
+        # 只有当最后一个复制按钮的内容不属于发送消息时，才判定AI回复完成
+        if copy_btn_count_before > 0 or not fast_wait:
+            log_info(f"[{ai_name}] 优先策略：复制按钮+内容感知检测（基线={copy_btn_count_before}）...")
+            btn_check_start = time.time()
+            btn_check_interval = 0.5 if not fast_wait else 0.3  # 加快检测频率
+            # 最长检测 30% 的超时时间（从60%降低，避免空转太久）
+            btn_deadline = min(deadline, time.time() + (timeout_ms / 1000) * 0.3)
+            sent_msg_misjudge_count = 0  # 连续误判为发送消息的计数
+            sent_msg_misjudge_limit = 5  # 连续5次误判（约2.5秒）则退出到步骤4
+            while time.time() < btn_deadline:
+                try:
+                    result = await asyncio.wait_for(
+                        page.evaluate(COUNT_COPY_BTN_WITH_CONTENT_JS),
+                        timeout=5
+                    )
+                    current_copy_btns = result.get("count", 0)
+                    last_content = result.get("last_content", "")
+                except asyncio.TimeoutError:
+                    log_warning(f"[{ai_name}] 复制按钮检测超时(5s)，回退到内容检测")
+                    break
+                except Exception as e:
+                    log_warning(f"[{ai_name}] 复制按钮检测异常: {e}，回退到内容检测")
+                    break
+
+                if current_copy_btns > copy_btn_count_before:
+                    # 复制按钮增加，检查最后一个是否属于AI回复（而非发送的消息）
+                    if not last_content:
+                        # 内容为空，无法判断是发送消息还是AI回复，继续等待
+                        # 不重置也不增加误判计数，等下一轮再检测
+                        log_info(f"[{ai_name}] 复制按钮增加({copy_btn_count_before}→{current_copy_btns})但内容为空，继续等待")
+                    elif self._is_sent_message_content(last_content, sent_message):
+                        # 最后一个复制按钮属于发送的消息，AI还未回复，继续等待
+                        sent_msg_misjudge_count += 1
+                        log_info(f"[{ai_name}] 复制按钮增加({copy_btn_count_before}→{current_copy_btns})但内容为发送消息({sent_msg_misjudge_count}/{sent_msg_misjudge_limit})")
+                        # 连续多次误判，说明内容获取逻辑可能有问题，退出到步骤4
+                        if sent_msg_misjudge_count >= sent_msg_misjudge_limit:
+                            log_info(f"[{ai_name}] 连续{sent_msg_misjudge_limit}次判断为发送消息，可能内容获取有误，回退到内容稳定检测")
+                            break
+                    else:
+                        # 最后一个复制按钮属于AI回复，检测完成！
+                        log_info(f"[{ai_name}] ✅ 复制按钮增加且内容为AI回复: {copy_btn_count_before} → {current_copy_btns}（耗时 {time.time()-btn_check_start:.1f}s）")
+                        if last_content:
+                            log_info(f"[{ai_name}] 最后复制按钮内容头部: {last_content[:60]}...")
+                        await asyncio.sleep(0.3)  # 缩短等待，DOM已渲染
+                        return
+                else:
+                    # 复制按钮未增加，重置误判计数
+                    sent_msg_misjudge_count = 0
+
+                await asyncio.sleep(btn_check_interval)
+
+            log_info(f"[{ai_name}] 复制按钮检测未触发（{time.time()-btn_check_start:.0f}s），回退到内容稳定检测")
+
+        # 步骤3: 回退策略 - 等待内容开始增长（AI开始输出，包括思考过程）
         log_info(f"等待AI回复内容开始增长（基线: {content_len_before}, 发送消息: {sent_len}）...")
-        # 降低阈值：某些AI页面使用虚拟滚动，发送的消息可能不会全部出现在innerText中
-        # 只要内容增长超过发送消息长度的30%+50即可
         expected_min_len = content_len_before + max(sent_len * 0.3, 50) + 50
-        # 但如果发送消息很长（>5000字），不要要求太多增长
         if sent_len > 5000:
-            expected_min_len = content_len_before + 200  # 长消息只需要少量增长即可
+            expected_min_len = content_len_before + 200
         wait_start = time.time()
         growth_started = False
         last_logged_len = 0
@@ -2275,7 +2570,7 @@ class ChromeManager:
                 )
             except asyncio.TimeoutError:
                 log_warning(f"页面内容检测超时(10s)，跳过增长等待")
-                growth_started = True  # 跳过增长等待，直接进入稳定检测
+                growth_started = True
                 break
             except Exception as e:
                 log_warning(f"页面内容检测异常: {e}，跳过增长等待")
@@ -2285,7 +2580,6 @@ class ChromeManager:
                 log_info(f"内容开始增长（{current_len} > {expected_min_len}，耗时 {time.time()-wait_start:.1f}s）")
                 growth_started = True
                 break
-            # 每5次检测记录一次，方便排查
             log_counter += 1
             if log_counter % 10 == 0 and current_len != last_logged_len:
                 log_info(f"等待增长中... 当前={current_len}, 目标={expected_min_len}（已等待{time.time()-wait_start:.0f}s）")
@@ -2296,28 +2590,116 @@ class ChromeManager:
             log_warning(f"等待内容增长超时，继续执行")
             return
 
-        # 步骤3: 持续监测内容增长，直到连续N秒无变化
-        check_interval = 0.3 if fast_wait else 0.5
-        stable_threshold = 2 if fast_wait else 4  # fast: 2s, normal: 4s
-        log_info(f"监测内容增长，等待稳定（连续{stable_threshold}秒无变化）...")
+        # 步骤4: 回退策略 - 持续监测内容增长，直到连续N秒无变化
+        # 同时并行检测复制按钮+内容，如果复制按钮增加且内容为AI回复则提前完成
+        check_interval = 0.3 if fast_wait else 0.5  # 加快检测频率到0.5秒
+        stable_threshold = 2 if fast_wait else 2  # 降低到2秒，因为内容感知检测更可靠
+        log_info(f"监测内容增长，等待稳定（连续{stable_threshold}秒无变化，{check_interval}秒/次）...")
         last_len = 0
         stable_seconds = 0
         monitor_start = time.time()
         shrink_detected = False
-        shrink_extra = 0  # 收缩带来的额外等待秒数（按收缩比例动态计算）
+        shrink_extra = 0
 
         while time.time() < deadline:
+            # 并行检测：内容长度 + 复制按钮数量 + 最后复制按钮内容
             try:
-                current_len = await asyncio.wait_for(
-                    page.evaluate("""() => document.body.innerText.length"""),
+                result = await asyncio.wait_for(
+                    page.evaluate("""() => {
+                        const len = document.body.innerText.length;
+                        const found = [];
+                        document.querySelectorAll('[aria-label]').forEach(el => {
+                            const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                            if (label === '复制' || label === 'copy' || label.includes('复制') || label.includes('copy')) {
+                                if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') found.push(el);
+                            }
+                        });
+                        document.querySelectorAll('button, [role="button"], [class*="icon-button"], [class*="action"]').forEach(el => {
+                            const text = (el.textContent || '').trim();
+                            if (text === '复制' || text === 'Copy') found.push(el);
+                        });
+                        document.querySelectorAll('[class*="copy" i]').forEach(el => {
+                            if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') found.push(el);
+                        });
+                        const fts = ['.ds-markdown--footer','[class*="message-action-bar"]','[class*="message-footer"]','[class*="answer-footer"]','[class*="segment-assistant-actions"]','[class*="chat-action"]','[class*="msg-action"]','[class*="reply-action"]','[class*="footer-action"]'];
+                        fts.forEach(sel => {
+                            try {
+                                document.querySelectorAll(sel).forEach(bar => {
+                                    const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"]');
+                                    if (btns.length > 0) {
+                                        for (const btn of btns) {
+                                            const aria = (btn.getAttribute('aria-label') || '').trim();
+                                            const text = (btn.textContent || '').trim();
+                                            if (aria !== '朗读' && aria !== 'Read aloud' && text !== '朗读') { found.push(btn); break; }
+                                        }
+                                    }
+                                });
+                            } catch(e) {}
+                        });
+                        const unique = [];
+                        const seen = new Set();
+                        found.forEach(el => { if (!seen.has(el)) { seen.add(el); unique.push(el); } });
+                        unique.sort((a, b) => {
+                            if (a === b) return 0;
+                            const pos = a.compareDocumentPosition(b);
+                            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                            return 0;
+                        });
+                        let lastContent = '';
+                        if (unique.length > 0) {
+                            const lastBtn = unique[unique.length - 1];
+                            // 策略A: 优先查找复制按钮附近的AI回复内容容器
+                            const replySels = ['.ds-markdown--content','div[class*="markdown-body"]','div[class*="message-content"]','div[class*="answer-content"]','div[class*="reply-content"]','div[class*="bubble-content"]','div[class*="markdown"]:not([class*="think"])','div[class*="bubble"]:not([class*="think"])','div[data-role="assistant"]','div[class*="prose"]'];
+                            let el = lastBtn;
+                            for (let i = 0; i < 15; i++) {
+                                if (!el) break;
+                                for (const sel of replySels) {
+                                    try {
+                                        const rEl = el.querySelector(sel);
+                                        if (rEl) { const t = rEl.innerText || ''; if (t.length > 10) { lastContent = t.substring(0, 150); break; } }
+                                    } catch(e) {}
+                                }
+                                if (lastContent) break;
+                                el = el.parentElement;
+                            }
+                            // 策略B: 回退到向上遍历
+                            if (!lastContent) {
+                                el = lastBtn;
+                                for (let i = 0; i < 15; i++) {
+                                    el = el.parentElement;
+                                    if (!el) break;
+                                    const text = el.innerText || '';
+                                    if (text.length > 10) { lastContent = text.substring(0, 150); break; }
+                                }
+                            }
+                        }
+                        return { len: len, count: unique.length, last_content: lastContent };
+                    }"""),
                     timeout=10
                 )
+                current_len = result.get("len", 0)
+                current_copy_btns = result.get("count", 0)
+                last_content = result.get("last_content", "")
             except asyncio.TimeoutError:
                 log_warning(f"页面内容监测超时(10s)，跳过稳定检测")
                 break
             except Exception as e:
                 log_warning(f"页面内容监测异常: {e}，跳过稳定检测")
                 break
+
+            # 复制按钮+内容感知检测：如果增加且内容为AI回复，说明回复完成
+            if current_copy_btns > copy_btn_count_before:
+                if not last_content:
+                    # 内容为空，无法判断，继续内容稳定检测
+                    pass
+                elif self._is_sent_message_content(last_content, sent_message):
+                    # 最后一个复制按钮属于发送的消息，继续等待
+                    pass
+                else:
+                    log_info(f"[{ai_name}] ✅ 稳定检测中复制按钮增加且内容为AI回复: {copy_btn_count_before} → {current_copy_btns}，AI回复完成")
+                    await asyncio.sleep(0.3)
+                    return
 
             if current_len == last_len:
                 stable_seconds += check_interval
@@ -2327,7 +2709,6 @@ class ChromeManager:
                     break
             elif current_len < last_len:
                 shrink_amount = last_len - current_len
-                # 按收缩比例动态计算额外等待：大幅收缩(>500字)给6秒，小幅收缩(<200字)给2秒
                 if shrink_amount > 500:
                     shrink_extra = max(shrink_extra, 6)
                 elif shrink_amount > 200:
@@ -2347,7 +2728,7 @@ class ChromeManager:
             await asyncio.sleep(check_interval)
 
         # 最终等待确保渲染完成
-        final_wait = 0.5 if fast_wait else 1
+        final_wait = 0.3 if fast_wait else 0.5
         await asyncio.sleep(final_wait)
 
     async def _wait_content_stable(self, page: Page, deadline: float,
@@ -2544,7 +2925,7 @@ class ChromeManager:
                 }
 
                 // ---- 检测文件附件标签 ----
-                // AI回复中可能包含上传文件的附件标签（如"PolySage_技术文档.txt 36KB"）
+                // AI回复中可能包含上传文件的附件标签（如"HuaShanLunJian_技术文档.txt 36KB"）
                 // 这些不是AI的实际回复内容
                 function isFileAttachment(el) {
                     const text = (el.innerText || '').trim();

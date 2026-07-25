@@ -51,7 +51,7 @@ pyz = PYZ(a.pure)
 
 exe_kwargs = dict(
     exclude_binaries=True,
-    name='聚慧',
+    name='话山论见',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -78,13 +78,13 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='聚慧',
+    name='话山论见',
 )
 
 if IS_MACOS:
     app = BUNDLE(
         coll,
-        name='聚慧.app',
+        name='话山论见.app',
         icon='AppIcon.icns' if os.path.exists('AppIcon.icns') else None,
-        bundle_identifier='com.polysage.app',
+        bundle_identifier='com.huashanlunjian.app',
     )

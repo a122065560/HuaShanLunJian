@@ -2,7 +2,7 @@
 ConfigManager - 配置文件管理模块
 
 负责 config.json 的加载、保存、验证和默认配置生成。
-配置文件路径：~/.polysage/config.json
+配置文件路径：~/.huashanlunjian/config.json
 """
 
 import json
@@ -16,12 +16,33 @@ except ImportError:
 
 
 # 配置目录与文件路径
-CONFIG_DIR = Path.home() / ".polysage"
+CONFIG_DIR = Path.home() / ".huashanlunjian"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# 旧版配置目录（PolySage 时代），启动时自动迁移
+_LEGACY_CONFIG_DIR = Path.home() / ".polysage"
+
+
+def _migrate_legacy_config():
+    """将旧版 ~/.polysage/ 配置目录迁移到 ~/.huashanlunjian/
+
+    如果旧目录存在且新目录不存在，直接重命名。
+    如果两者都存在，保留新目录（优先）。
+    """
+    try:
+        if _LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
+            _LEGACY_CONFIG_DIR.rename(CONFIG_DIR)
+            log_info(f"配置目录已迁移: {_LEGACY_CONFIG_DIR} → {CONFIG_DIR}")
+    except Exception as e:
+        log_info(f"配置目录迁移失败（不影响使用）: {e}")
+
+
+# 启动时执行迁移
+_migrate_legacy_config()
 
 # 默认配置版本号（每次修改 DEFAULT_CONFIG 中的选择器/思考模式时递增）
 # 用于判断用户配置是否需要同步更新默认平台的配置
-DEFAULT_CONFIG_VERSION = 8
+DEFAULT_CONFIG_VERSION = 9
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -100,7 +121,7 @@ DEFAULT_CONFIG = {
                 "auth_storage_keys": ["chatglm_token", "token", "user"],
             },
             "thinking_mode": {
-                "enabled": True,
+                "enabled": False,
                 # 检测配置（只读检测，不操作）
                 "detect": {
                     "type": "dropdown",
@@ -133,7 +154,7 @@ DEFAULT_CONFIG = {
                 "auth_storage_keys": ["token", "userToken", "userInfo", "login_aliyunid_token"],
             },
             "thinking_mode": {
-                "enabled": True,
+                "enabled": False,
                 "detect": {
                     "type": "toggle",
                     "selector": "button[aria-label='思考']",
@@ -164,7 +185,7 @@ DEFAULT_CONFIG = {
                 "auth_storage_keys": ["token", "userToken", "userInfo", "sessionToken"],
             },
             "thinking_mode": {
-                "enabled": True,
+                "enabled": False,
                 "detect": {
                     "type": "toggle",
                     "selector": "button[data-testid='model-thinking-trigger-toggle']",
@@ -195,7 +216,7 @@ DEFAULT_CONFIG = {
                 "auth_storage_keys": ["token", "userToken", "userInfo", "access_token"],
             },
             "thinking_mode": {
-                "enabled": True,
+                "enabled": False,
                 "detect": {
                     "type": "dropdown",
                     "label_selector": "div.model-name span.name",
@@ -232,7 +253,7 @@ DEFAULT_CONFIG = {
                 "auth_storage_keys": ["sessionid", "uid", "sid_tt", "uid_tt", "passport_csrf_token", "samantha_web_web_id"],
             },
             "thinking_mode": {
-                "enabled": True,
+                "enabled": False,
                 "detect": {
                     "type": "dropdown",
                     # 豆包模式选择器：div[data-valid-btn="mode-select-action-btn"] 内的可见按钮
@@ -264,7 +285,7 @@ class ConfigManager:
         初始化配置管理器。
 
         Args:
-            config_path: 自定义配置文件路径，默认为 ~/.polysage/config.json
+            config_path: 自定义配置文件路径，默认为 ~/.huashanlunjian/config.json
         """
         self.config_path = Path(config_path) if config_path else CONFIG_FILE
         self.config = None

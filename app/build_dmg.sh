@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# 聚慧 一键打包脚本
+# 话山论见 一键打包脚本
 # 生成 macOS ARM64 .app 和 .dmg 安装包
 # ============================================================
 set -e
@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}================================================${NC}"
-echo -e "${BLUE}  🪑 聚慧 PolySage 打包脚本 (ARM64)${NC}"
+echo -e "${BLUE}  🪑 话山论见 HuaShanLunJian 打包脚本 (ARM64)${NC}"
 echo -e "${BLUE}================================================${NC}"
 echo ""
 
@@ -25,7 +25,7 @@ cd "$SCRIPT_DIR"
 
 DIST_DIR="$SCRIPT_DIR/dist"
 BUILD_DIR="$SCRIPT_DIR/build"
-DMG_NAME="${DMG_NAME:-聚慧-v1.0.0-arm64.dmg}"
+DMG_NAME="${DMG_NAME:-话山论见-v1.2.0-arm64.dmg}"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -47,16 +47,94 @@ echo -e "${YELLOW}  ⏳ 检查项目依赖...${NC}"
 python3 -m pip install -r requirements.txt --break-system-packages -q 2>&1 | tail -3
 echo -e "${GREEN}  ✅ 项目依赖已就绪${NC}"
 
-# 下载 Playwright Chromium 到临时目录（避免 PyInstaller collect_all 处理 Mach-O 二进制失败）
-PW_BROWSERS_TMP="/tmp/pw-chromium-cache"
-if [ -d "$PW_BROWSERS_TMP/chromium-1228" ]; then
-    echo -e "${GREEN}  ✅ Chromium 已存在于临时目录，跳过下载${NC}"
-else
-    echo -e "${YELLOW}  ⏳ 下载 Playwright Chromium...${NC}"
-    rm -rf "$PW_BROWSERS_TMP"
-    PLAYWRIGHT_BROWSERS_PATH="$PW_BROWSERS_TMP" python3 -m playwright install chromium 2>&1 | tail -3
-    echo -e "${GREEN}  ✅ Chromium 已下载到临时目录${NC}"
+# 下载 Playwright Chromium 到用户目录（避免 /tmp 被沙箱阻止，且重启后缓存持久）
+# 用 curl 直接下载（playwright install 在沙箱下会 EPERM 失败）
+PW_BROWSERS_TMP="${HOME}/.huashanlunjian/pw-chromium-cache"
+# 向后兼容：如果旧版缓存目录存在，迁移到新目录
+if [ -d "${HOME}/.polysage/pw-chromium-cache" ] && [ ! -d "$PW_BROWSERS_TMP" ]; then
+    mkdir -p "${HOME}/.huashanlunjian"
+    mv "${HOME}/.polysage/pw-chromium-cache" "$PW_BROWSERS_TMP"
+    echo -e "${YELLOW}  📦 Chromium 缓存已迁移: ~/.polysage → ~/.huashanlunjian${NC}"
 fi
+CHROME_VER="149.0.7827.55"
+CHROME_REV="1228"
+FFMPEG_REV="1011"
+PW_BASE="https://cdn.playwright.dev/builds/cft/${CHROME_VER}/mac-arm64"
+FFMPEG_URL="https://cdn.playwright.dev/builds/ffmpeg/${FFMPEG_REV}/ffmpeg-mac-arm64.zip"
+
+# 下载并解压单个组件（参数: url, 目标目录）
+_download_pw_component() {
+    local url="$1"
+    local dest_dir="$2"
+    local tmp_zip="${HOME}/.huashanlunjian/_pw_download.zip"
+    echo -e "${YELLOW}    下载: $url${NC}"
+    if curl -L -o "$tmp_zip" "$url" --progress-bar 2>&1 | tail -1; then
+        mkdir -p "$dest_dir"
+        unzip -q -o "$tmp_zip" -d "$dest_dir/" 2>&1
+        rm -f "$tmp_zip"
+        return 0
+    else
+        echo -e "${RED}    下载失败: $url${NC}"
+        rm -f "$tmp_zip"
+        return 1
+    fi
+}
+
+# 确保所有 Playwright 浏览器组件都已下载
+# chromium-1228: 完整 Chromium（headful 模式）
+# chromium_headless_shell-1228: 无头 Shell（headless=True 时需要）
+# ffmpeg-1011: 视频录制组件
+ensure_pw_browsers() {
+    local need_download=0
+    [ ! -d "$PW_BROWSERS_TMP/chromium-${CHROME_REV}" ] && need_download=1
+    [ ! -d "$PW_BROWSERS_TMP/chromium_headless_shell-${CHROME_REV}" ] && need_download=1
+    # ffmpeg 可选，不强制
+
+    if [ $need_download -eq 0 ]; then
+        echo -e "${GREEN}  ✅ Chromium 已存在于缓存目录，跳过下载${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}  ⏳ 下载 Playwright Chromium 组件...${NC}"
+    mkdir -p "$PW_BROWSERS_TMP"
+
+    # 1. Chromium (headful)
+    if [ ! -d "$PW_BROWSERS_TMP/chromium-${CHROME_REV}" ]; then
+        _download_pw_component \
+            "${PW_BASE}/chrome-mac-arm64.zip" \
+            "$PW_BROWSERS_TMP/chromium-${CHROME_REV}" \
+            && echo -e "${GREEN}    ✅ Chromium 已下载${NC}" \
+            || echo -e "${RED}    ❌ Chromium 下载失败${NC}"
+    fi
+
+    # 2. Headless Shell (headless=True 时需要)
+    if [ ! -d "$PW_BROWSERS_TMP/chromium_headless_shell-${CHROME_REV}" ]; then
+        _download_pw_component \
+            "${PW_BASE}/chrome-headless-shell-mac-arm64.zip" \
+            "$PW_BROWSERS_TMP/chromium_headless_shell-${CHROME_REV}" \
+            && echo -e "${GREEN}    ✅ Headless Shell 已下载${NC}" \
+            || echo -e "${YELLOW}    ⚠️  Headless Shell 下载失败（非关键）${NC}"
+    fi
+
+    # 3. FFmpeg (视频录制，可选)
+    if [ ! -d "$PW_BROWSERS_TMP/ffmpeg-${FFMPEG_REV}" ]; then
+        _download_pw_component \
+            "$FFMPEG_URL" \
+            "$PW_BROWSERS_TMP/ffmpeg-${FFMPEG_REV}" \
+            && echo -e "${GREEN}    ✅ FFmpeg 已下载${NC}" \
+            || echo -e "${YELLOW}    ⚠️  FFmpeg 下载失败（非关键）${NC}"
+    fi
+
+    # 最终验证
+    if [ -d "$PW_BROWSERS_TMP/chromium-${CHROME_REV}" ]; then
+        echo -e "${GREEN}  ✅ Chromium 缓存就绪${NC}"
+    else
+        echo -e "${RED}  ❌ Chromium 下载失败，内置浏览器将不可用${NC}"
+        echo -e "${BLUE}  可手动运行 AGENTS.md 中的 curl 下载命令${NC}"
+    fi
+}
+
+ensure_pw_browsers
 
 # 检查 PyInstaller
 if ! python3 -c "import PyInstaller" 2>/dev/null; then
@@ -74,8 +152,8 @@ echo -e "${YELLOW}[2/7] 清理旧产物...${NC}"
 # 先清除扩展属性和保护标志，防止 macOS 阻止删除
 xattr -cr "$BUILD_DIR" "$DIST_DIR" 2>/dev/null || true
 chflags -R nouchg "$BUILD_DIR" "$DIST_DIR" 2>/dev/null || true
-rm -rf "$BUILD_DIR" "$DIST_DIR"
-rm -rf "$SCRIPT_DIR/__pycache__"
+rm -rf "$BUILD_DIR" "$DIST_DIR" 2>/dev/null || true
+rm -rf "$SCRIPT_DIR/__pycache__" 2>/dev/null || true
 find "$SCRIPT_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 echo -e "${GREEN}  ✅ 已清理${NC}"
 echo ""
@@ -94,8 +172,8 @@ python3 -m PyInstaller \
     --clean \
     --target-arch arm64 \
     --windowed \
-    --osx-bundle-identifier com.polysage.app \
-    --name "聚慧" \
+    --osx-bundle-identifier com.huashanlunjian.app \
+    --name "话山论见" \
     --icon AppIcon.icns \
     --add-data "logo_ui.png:." \
     --add-data "logo_ui@2x.png:." \
@@ -180,7 +258,7 @@ python3 -m PyInstaller \
     --exclude-module PyQt6.QtXml \
     2>&1 | tail -10
 
-if [ ! -d "$DIST_DIR/聚慧.app" ]; then
+if [ ! -d "$DIST_DIR/话山论见.app" ]; then
     echo -e "${RED}❌ 打包失败${NC}"
     exit 1
 fi
@@ -194,7 +272,7 @@ echo ""
 # ----------------------------------------------------------------
 echo -e "${YELLOW}[4/7] 优化 Qt6 framework 和 Playwright driver...${NC}"
 
-APP_BUNDLE="$DIST_DIR/聚慧.app"
+APP_BUNDLE="$DIST_DIR/话山论见.app"
 APP_FW="$APP_BUNDLE/Contents/Frameworks"
 APP_QT6LIB="$APP_FW/PyQt6/Qt6/lib"
 
@@ -227,27 +305,50 @@ else
     echo -e "${YELLOW}  ⚠️  Qt6 库未找到 (QT6_LIB='$QT6_LIB')${NC}"
 fi
 
-# Playwright driver 已由 PyInstaller --collect-all 正确放到 Frameworks/playwright/driver
-# 无需额外复制（旧逻辑 cp -r 到 _internal 会导致 driver/driver 嵌套重复 +99MB）
+# Playwright driver 已由 PyInstaller --collect-all 正确放到 Resources/playwright/driver
+# （PyInstaller --windowed .app 中 sys._MEIPASS = Contents/Resources/，Python 包在 Resources）
 echo -e "${GREEN}  ✅ Playwright driver 已就绪（PyInstaller 自动放置）${NC}"
 
 # 复制 Playwright Chromium 浏览器到 .app 包内
-# （单独复制而非 PyInstaller 打包，避免 collect_all 处理 Mach-O 二进制失败）
-BROWSER_DEST="$APP_FW/playwright/driver/package/.local-browsers"
-if [ -d "$PW_BROWSERS_TMP" ]; then
-    mkdir -p "$BROWSER_DEST"
-    cp -R "$PW_BROWSERS_TMP"/* "$BROWSER_DEST/"
-    echo -e "${GREEN}  ✅ Chromium 浏览器已复制到 .app 包内${NC}"
+# 关键：同时复制到 Resources 和 Frameworks 两个位置，覆盖所有可能的 sys._MEIPASS 解析路径
+# - sys._MEIPASS = Contents/Resources/ → 在 Resources/playwright/driver/package/ 搜索
+# - sys._MEIPASS = Contents/Resources/_internal/ (= ../Frameworks/) → 在 Frameworks/playwright/driver/package/ 搜索
+# 同时创建 local-browsers（不带点）符号链接，兼容 PLAYWRIGHT_BROWSERS_PATH=0
+APP_RESOURCES="$APP_BUNDLE/Contents/Resources"
+_copy_chromium_to() {
+    local dest_parent="$1"
+    if [ ! -d "$dest_parent/playwright/driver/package" ]; then
+        return 1
+    fi
+    local dest="$dest_parent/playwright/driver/package/.local-browsers"
+    mkdir -p "$dest"
+    cp -R "$PW_BROWSERS_TMP"/* "$dest/"
+    # 创建 local-browsers（不带点）符号链接 → .local-browsers（带点）
+    ln -sf ".local-browsers" "$dest_parent/playwright/driver/package/local-browsers"
+    return 0
+}
+
+if [ -d "$PW_BROWSERS_TMP" ] && [ -d "$PW_BROWSERS_TMP/chromium-1228" ]; then
+    # 复制到 Resources（sys._MEIPASS = Contents/Resources/ 时）
+    if _copy_chromium_to "$APP_RESOURCES"; then
+        echo -e "${GREEN}  ✅ Chromium 已复制到 Resources/playwright/.local-browsers${NC}"
+    fi
+    # 复制到 Frameworks（sys._MEIPASS = Contents/Resources/_internal/ = Frameworks/ 时）
+    if _copy_chromium_to "$APP_FW"; then
+        echo -e "${GREEN}  ✅ Chromium 已复制到 Frameworks/playwright/.local-browsers${NC}"
+    fi
+    echo -e "${GREEN}  ✅ local-browsers 符号链接已创建（兼容 PLAYWRIGHT_BROWSERS_PATH=0）${NC}"
 else
-    echo -e "${YELLOW}  ⚠️  Chromium 未下载，内置浏览器可能不可用${NC}"
+    echo -e "${RED}  ❌ Chromium 未下载，内置浏览器将不可用！${NC}"
+    echo -e "${BLUE}  请手动运行: PLAYWRIGHT_BROWSERS_PATH=\"$PW_BROWSERS_TMP\" python3 -m playwright install chromium${NC}"
 fi
 
 # 清理 PyInstaller 创建的断裂符号链接（指向已删除 framework 的链接）
 find "$APP_FW" -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 echo -e "${GREEN}  ✅ 已清理断裂符号链接${NC}"
 
-# 删除 COLLECT 目录残留（PyInstaller 生成的 dist/聚慧/，与 .app 内容重复，占305MB）
-rm -rf "$DIST_DIR/聚慧"
+# 删除 COLLECT 目录残留（PyInstaller 生成的 dist/话山论见/，与 .app 内容重复，占305MB）
+rm -rf "$DIST_DIR/话山论见"
 
 # 更新 Info.plist 和应用图标
 cp "$SCRIPT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
@@ -305,17 +406,17 @@ echo ""
 # ----------------------------------------------------------------
 echo -e "${YELLOW}[5/7] 签名 .app...${NC}"
 # 移除可能残留的 entitlements 和 TCC 记录（非关键步骤，失败不阻断）
-xattr -cr "$DIST_DIR/聚慧.app" 2>/dev/null || true
+xattr -cr "$DIST_DIR/话山论见.app" 2>/dev/null || true
 # 用 --deep 递归签名所有组件（ad-hoc 签名不能用 --options=runtime，会导致 Team ID 不一致）
 # 签名是 ad-hoc 的，失败不影响功能（用户右键→打开即可），用 || true 防止 set -e 退出
-codesign --force --deep --sign - "$DIST_DIR/聚慧.app" 2>&1 | tail -2 || true
+codesign --force --deep --sign - "$DIST_DIR/话山论见.app" 2>&1 | tail -2 || true
 echo -e "${GREEN}  ✅ 签名完成${NC}"
 
 # 签名后创建 _internal 符号链接（codesign --deep 无法处理指向父目录的符号链接，会报错退出）
 # PyInstaller 的 PyQt6 runtime hook 通过 _internal 路径查找 Qt plugins/libraries
-ln -sf ../Frameworks "$DIST_DIR/聚慧.app/Contents/Resources/_internal"
+ln -sf ../Frameworks "$DIST_DIR/话山论见.app/Contents/Resources/_internal"
 # 验证符号链接
-if [ -L "$DIST_DIR/聚慧.app/Contents/Resources/_internal" ]; then
+if [ -L "$DIST_DIR/话山论见.app/Contents/Resources/_internal" ]; then
     echo -e "${GREEN}  ✅ _internal 符号链接已创建（→ ../Frameworks）${NC}"
 else
     echo -e "${RED}  ❌ _internal 符号链接创建失败！${NC}"
@@ -323,8 +424,12 @@ fi
 echo ""
 
 # ----------------------------------------------------------------
-# Step 6: 生成 .dmg
+# Step 6: 生成 .dmg（可通过 SKIP_DMG=1 跳过）
 # ----------------------------------------------------------------
+if [ -n "$SKIP_DMG" ]; then
+    echo -e "${YELLOW}[6/7] 跳过 .dmg 生成（SKIP_DMG 模式，仅生成 .app）${NC}"
+    echo ""
+else
 echo -e "${YELLOW}[6/7] 生成 .dmg 安装包...${NC}"
 
 DMG_PATH="$OUTPUT_DIR/$DMG_NAME"
@@ -333,13 +438,13 @@ DMG_STAGING="$DIST_DIR/dmg_staging"
 rm -rf "$DMG_STAGING" "$DMG_PATH"
 mkdir -p "$DMG_STAGING"
 
-cp -R "$DIST_DIR/聚慧.app" "$DMG_STAGING/"
+cp -R "$DIST_DIR/话山论见.app" "$DMG_STAGING/"
 ln -s /Applications "$DMG_STAGING/Applications"
 
 echo -e "${BLUE}  创建磁盘镜像（单步模式，无需挂载）...${NC}"
 # 使用单步 hdiutil create，直接生成压缩后的 .dmg，避免 attach/detach 操作
 hdiutil create \
-    -volname "聚慧 PolySage" \
+    -volname "话山论见 HuaShanLunJian" \
     -srcfolder "$DMG_STAGING" \
     -ov \
     -fs HFS+ \
@@ -352,10 +457,11 @@ rm -rf "$DMG_STAGING"
 if [ -f "$DMG_PATH" ]; then
     echo -e "${GREEN}  ✅ .dmg 生成成功${NC}"
 else
-    echo -e "${RED}❌ .dmg 生成失败${NC}"
-    exit 1
+    # .dmg 失败不阻断流程，.app 已生成，继续执行后续步骤
+    echo -e "${YELLOW}  ⚠️  .dmg 生成失败，但 .app 已成功构建，继续...${NC}"
 fi
 echo ""
+fi  # 结束 SKIP_DMG 判断
 
 # ----------------------------------------------------------------
 # Step 7: 完成报告
@@ -367,18 +473,18 @@ echo -e "${GREEN}  🎉 打包成功！${NC}"
 echo -e "${BLUE}================================================${NC}"
 echo ""
 echo -e "${GREEN}📦 产物位置：${NC}"
-echo -e "  App:  $OUTPUT_DIR/聚慧.app"
+echo -e "  App:  $OUTPUT_DIR/话山论见.app"
 echo -e "  DMG:  $DMG_PATH"
 echo ""
 
 # 复制 .app 到 build/ 目录
-if [ -d "$DIST_DIR/聚慧.app" ]; then
-    rm -rf "$OUTPUT_DIR/聚慧.app"
-    cp -R "$DIST_DIR/聚慧.app" "$OUTPUT_DIR/聚慧.app"
+if [ -d "$DIST_DIR/话山论见.app" ]; then
+    rm -rf "$OUTPUT_DIR/话山论见.app"
+    cp -R "$DIST_DIR/话山论见.app" "$OUTPUT_DIR/话山论见.app"
     echo -e "${GREEN}  ✅ .app 已复制到 build/ 目录${NC}"
 fi
 
-APP_SIZE=$(du -sh "$DIST_DIR/聚慧.app" 2>/dev/null | cut -f1)
+APP_SIZE=$(du -sh "$DIST_DIR/话山论见.app" 2>/dev/null | cut -f1)
 DMG_SIZE=$(du -sh "$DMG_PATH" 2>/dev/null | cut -f1)
 echo -e "${GREEN}📊 文件大小：${NC}"
 echo -e "  App:  $APP_SIZE"
@@ -386,15 +492,15 @@ echo -e "  DMG:  $DMG_SIZE"
 echo ""
 
 echo -e "${GREEN}🔧 架构验证：${NC}"
-ARCH=$(lipo -archs "$DIST_DIR/聚慧.app/Contents/MacOS/聚慧" 2>/dev/null || echo "unknown")
+ARCH=$(lipo -archs "$DIST_DIR/话山论见.app/Contents/MacOS/话山论见" 2>/dev/null || echo "unknown")
 echo -e "  可执行文件架构: $ARCH"
 echo ""
 
 echo -e "${BLUE}💡 安装方法：${NC}"
 echo -e "  1. 双击 .dmg 文件挂载"
-echo -e "  2. 将 聚慧.app 拖到 Applications 文件夹"
+echo -e "  2. 将 话山论见.app 拖到 Applications 文件夹"
 echo -e "  3. 首次打开：右键 → 打开（绕过 Gatekeeper）"
-echo -e "  4. 在启动台打开 聚慧 PolySage"
+echo -e "  4. 在启动台打开 话山论见 HuaShanLunJian"
 echo ""
 
 # ----------------------------------------------------------------

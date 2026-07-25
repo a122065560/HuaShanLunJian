@@ -2,7 +2,7 @@
 windows_adapter - Windows 平台适配器实现
 
 实现 PlatformAdapter 抽象接口，提供 Windows 下的：
-- 应用数据目录 / Chrome 用户数据目录 / 配置文件路径（%LOCALAPPDATA%/PolySage）
+- 应用数据目录 / Chrome 用户数据目录 / 配置文件路径（%LOCALAPPDATA%/HuaShanLunJian）
 - Chrome 调试进程启动（subprocess.Popen + DETACHED_PROCESS +
   CREATE_NEW_PROCESS_GROUP，必须带 --no-sandbox）
 - 进程树递归终止（CDP 优雅关闭 → psutil 递归杀进程树 → 清理锁文件）
@@ -93,9 +93,9 @@ class WindowsAdapter(PlatformAdapter):
         return "Windows"
 
     def app_data_dir(self) -> Path:
-        """应用数据目录：%LOCALAPPDATA%/PolySage"""
+        """应用数据目录：%LOCALAPPDATA%/HuaShanLunJian"""
         base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-        return Path(base) / "PolySage"
+        return Path(base) / "HuaShanLunJian"
 
     def default_user_data_dir(self) -> Path:
         """

@@ -2,7 +2,7 @@
 logger - 全局日志模块（多组件分文件架构）
 
 目录结构：
-  ~/.polysage/logs/
+  ~/.huashanlunjian/logs/
   ├── 20260709/
   │   ├── ui.log              ← 主UI: 用户操作
   │   ├── brain.log           ← 大脑线程: 调度事件
@@ -26,7 +26,7 @@ from pathlib import Path
 
 # ==================== 路径管理 ====================
 
-LOG_BASE_DIR = Path.home() / ".polysage" / "logs"
+LOG_BASE_DIR = Path.home() / ".huashanlunjian" / "logs"
 
 # 日志组件类型
 COMPONENT_UI = "ui"
@@ -46,7 +46,7 @@ def _get_actual_log_base():
         pass
 
     import tempfile
-    fallback = Path(tempfile.gettempdir()) / "polysage_logs"
+    fallback = Path(tempfile.gettempdir()) / "huashanlunjian_logs"
     try:
         fallback.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -122,7 +122,7 @@ def _get_component_logger(component: str) -> logging.Logger:
             old_logger.removeHandler(h)
 
     # 创建新 logger
-    logger = logging.getLogger(f"PolySage_{cache_key}")
+    logger = logging.getLogger(f"HuaShanLunJian_{cache_key}")
     logger.setLevel(logging.DEBUG)
 
     # 如果已有 handlers，先清理
@@ -272,7 +272,7 @@ def setup_logger() -> logging.Logger:
 
     # 写入启动信息到 brain.log
     log_info("=" * 60)
-    log_info("聚慧 PolySage 日志系统已启动")
+    log_info("话山论见 HuaShanLunJian 日志系统已启动")
     log_info(f"Python: {sys.version}")
     log_info(f"平台: {sys.platform}")
     log_info(f"日志目录: {_ensure_log_base()}")

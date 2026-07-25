@@ -1,5 +1,5 @@
 """
-main - 聚慧 PolySage 程序入口
+main - 话山论见 HuaShanLunJian 程序入口
 
 使用 qasync 将 asyncio 事件循环集成到 PyQt6 的事件循环中，
 使 Playwright 的异步操作（await）可以在槽函数中安全使用，UI 不会卡死。
@@ -18,7 +18,7 @@ import os
 # 判断是否在 PyInstaller 打包环境中运行
 if getattr(sys, 'frozen', False):
     if sys.platform == 'darwin':
-        # macOS .app 包结构: Contents/MacOS/PolySage, Contents/Resources/_internal/
+        # macOS .app 包结构: Contents/MacOS/HuaShanLunJian, Contents/Resources/_internal/
         _BASE = os.path.dirname(sys.executable)  # Contents/MacOS/
         _APP_BUNDLE = os.path.dirname(_BASE)       # Contents/
         _INTERNAL = os.path.join(_APP_BUNDLE, 'Resources', '_internal')
@@ -76,9 +76,9 @@ def main():
 
     # 1. 创建 QApplication
     app = QApplication(sys.argv)
-    app.setApplicationName("聚慧")
-    app.setApplicationDisplayName("🪑 聚慧")
-    app.setOrganizationName("PolySage")
+    app.setApplicationName("话山论见")
+    app.setApplicationDisplayName("🪑 话山论见")
+    app.setOrganizationName("HuaShanLunJian")
 
     # 设置应用图标
     if getattr(sys, 'frozen', False):

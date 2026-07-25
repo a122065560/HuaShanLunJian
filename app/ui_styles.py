@@ -1,5 +1,5 @@
 """
-聚慧 PolySage 全局 QSS 样式表
+话山论见 HuaShanLunJian 全局 QSS 样式表
 
 设计参考：macOS 原生设计语言
 - 分层按钮体系：Primary / Secondary / Danger / Ghost / Icon / Small

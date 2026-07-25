@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1 align="center"><img src="logo.png" width="28" height="28" style="vertical-align: middle; margin-right: 6px;" alt="聚慧"> 聚慧 PolySage</h1>
+<h1 align="center"><img src="logo.png" width="28" height="28" style="vertical-align: middle; margin-right: 6px;" alt="话山论见"> 话山论见 HuaShanLunJian</h1>
 
 **多 AI 圆桌讨论桌面应用**
 
@@ -14,7 +14,7 @@
 
 ## 简介
 
-聚慧 PolySage 是一款桌面应用，让多个 AI（DeepSeek、智谱清言、通义千问、MiniMax、Kimi 等）围绕你提出的话题展开**多轮圆桌讨论**，互相质疑、补充、碰撞，最终产出结构化方案。
+话山论见 HuaShanLunJian 是一款桌面应用，让多个 AI（DeepSeek、智谱清言、通义千问、MiniMax、Kimi 等）围绕你提出的话题展开**多轮圆桌讨论**，互相质疑、补充、碰撞，最终产出结构化方案。
 
 **无需任何 API Key** —— 应用通过 Playwright 控制已登录的 AI 网页完成一切操作。
 
@@ -28,7 +28,7 @@
 
 ## 快速开始
 
-1. 安装后打开「聚慧」
+1. 安装后打开「话山论见」
 2. 点击左侧「🚀 启动 Chrome」启动浏览器
 3. 在弹出的 Chrome 中登录你要使用的 AI 平台
 4. 回到应用，勾选已登录的 AI，输入话题
@@ -40,8 +40,8 @@
 
 | 文件 | 平台 | 说明 |
 |------|------|------|
-| `PolySage-v*-macOS.dmg` | macOS (Apple Silicon) | 双击安装 |
-| `PolySage-v*-Windows.exe` | Windows x64 | 双击安装 |
+| `HuaShanLunJian-v*-macOS.dmg` | macOS (Apple Silicon) | 双击安装 |
+| `HuaShanLunJian-v*-Windows.exe` | Windows x64 | 双击安装 |
 
 ## 技术栈
 
@@ -76,6 +76,6 @@ bash app/build_dmg.sh
 
 <div align="center">
 
-MIT License · Copyright © 2026 聚慧 PolySage
+MIT License · Copyright © 2026 话山论见 HuaShanLunJian
 
 </div>

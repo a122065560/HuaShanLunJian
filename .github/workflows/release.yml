@@ -1,11 +1,11 @@
 # ============================================================
-# PolySage（聚慧）多平台发布构建工作流
+# HuaShanLunJian（话山论见）多平台发布构建工作流
 # ------------------------------------------------------------
 # 触发方式：
 #   1. 手动触发 (workflow_dispatch) —— 输入版本号
 #   2. 推送 v* 标签自动触发
 # 构建平台：macOS (ARM64) + Windows (x64)
-# 产物：聚慧-{version}-arm64.dmg / 聚慧-{version}-Windows.exe
+# 产物：话山论见-{version}-arm64.dmg / 话山论见-{version}-Windows.exe
 # ============================================================
 name: 发布构建
 
@@ -51,14 +51,14 @@ jobs:
         working-directory: app
         env:
           GITHUB_ACTIONS: 'true'
-          DMG_NAME: PolySage-${{ env.VERSION }}-arm64.dmg
+          DMG_NAME: HuaShanLunJian-${{ env.VERSION }}-arm64.dmg
         run: bash build_dmg.sh
 
       - name: 上传 macOS DMG
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
-          path: build/PolySage-${{ env.VERSION }}-arm64.dmg
+          path: build/HuaShanLunJian-${{ env.VERSION }}-arm64.dmg
           retention-days: 30
 
   # ============================================================
@@ -91,7 +91,7 @@ jobs:
 
       - name: PyInstaller 打包
         working-directory: app
-        run: pyinstaller --noconfirm PolySage.spec
+        run: pyinstaller --noconfirm HuaShanLunJian.spec
 
       - name: 配置 Inno Setup
         run: echo "C:\Program Files (x86)\Inno Setup 6" >> $GITHUB_PATH
@@ -102,8 +102,8 @@ jobs:
       - name: 移动到根目录
         shell: bash
         run: |
-          mv "common/PolySage-${{ env.VERSION }}-Windows.exe" .
-          ls -la "PolySage-${{ env.VERSION }}-Windows.exe"
+          mv "common/HuaShanLunJian-${{ env.VERSION }}-Windows.exe" .
+          ls -la "HuaShanLunJian-${{ env.VERSION }}-Windows.exe"
 
       - name: 代码签名
         if: ${{ env.CERTIFICATE_BASE64 != '' }}
@@ -117,13 +117,13 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName sign /f cert.pfx /p $env:CERT_PASSWORD `
             /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
-            "PolySage-${{ env.VERSION }}-Windows.exe"
+            "HuaShanLunJian-${{ env.VERSION }}-Windows.exe"
 
       - name: 上传 Windows 安装包
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: PolySage-${{ env.VERSION }}-Windows.exe
+          path: HuaShanLunJian-${{ env.VERSION }}-Windows.exe
           retention-days: 30
 
   # ============================================================
@@ -147,7 +147,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
-          name: 聚慧 PolySage ${{ env.VERSION }} 正式版
+          name: 话山论见 HuaShanLunJian ${{ env.VERSION }} 正式版
           files: |
             artifacts/macos-dmg/*.dmg
             artifacts/windows-exe/*.exe

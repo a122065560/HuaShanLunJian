@@ -8,8 +8,8 @@ __pycache__/
 app/dist/
 app/build/
 *.spec.bak
-# PyInstaller 自动生成的 spec（PolySage.spec 是 Windows CI 用的，需要保留）
-聚慧.spec
+# PyInstaller 自动生成的 spec（HuaShanLunJian.spec 是 Windows CI 用的，需要保留）
+话山论见.spec
 
 # 虚拟环境
 venv/
@@ -44,8 +44,8 @@ test-results/
 # 构建产物（build/ 目录）
 build/
 # 项目根目录下的 .app（构建意外输出到根目录时忽略）
-/聚慧.app
-/聚慧-*.dmg
+/话山论见.app
+/话山论见-*.dmg
 
 # 临时文件
 tmp/

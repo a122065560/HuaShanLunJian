@@ -4,7 +4,7 @@ platform_adapter - 跨平台抽象层
 定义平台无关的抽象接口 PlatformAdapter，以及 Chrome 启动所需的数据结构。
 具体平台实现见 macos_adapter.py 与 windows_adapter.py。
 
-聚慧（PolySage）通过 current_adapter() 工厂函数获取当前平台的适配器实例，
+话山论见（HuaShanLunJian）通过 current_adapter() 工厂函数获取当前平台的适配器实例，
 实现 macOS / Windows 上的 Chrome 调试进程管理、端口检测、进程树清理等能力。
 
 设计目标：
@@ -196,7 +196,7 @@ def current_adapter() -> PlatformAdapter:
         _cached_adapter = WindowsAdapter()
     else:
         raise RuntimeError(
-            f"不支持的平台: {sys.platform}（聚慧目前仅支持 macOS / Windows）"
+            f"不支持的平台: {sys.platform}（话山论见目前仅支持 macOS / Windows）"
         )
 
     return _cached_adapter
