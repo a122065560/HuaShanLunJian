@@ -409,7 +409,7 @@ def build_supplement_prompt(user_msg: str, arbitrator: str,
 
 def build_summary_prompt(history: list) -> str:
     """
-    构建要求 AI/LM Studio 汇总讨论历史的提示。
+    构建要求 AI 汇总讨论历史的提示。
 
     Args:
         history: 讨论历史列表，每条为 "【AI名称】\\n内容"

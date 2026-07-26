@@ -1,7 +1,7 @@
 """
 core - 托管模式核心模块
 
-HostedMode：N 位 AI 全自动轮转讨论主循环 + 结案机制（auto / 指定AI / lm_studio）。
+HostedMode：N 位 AI 全自动轮转讨论主循环 + 结案机制（auto / 指定AI）。
 
 讨论流程：
   Phase 1 → 向 ai_list[0] 发送开场白 + 话题，提取回复
@@ -1586,7 +1586,6 @@ class HostedMode:
         Args:
             arbitrator_name: 仲裁模式
                 "auto" → 提取哨兵标记前的内容
-                "lm_studio" → 发给本地模型汇总
                 指定 AI 名称 → 将历史发给该 AI 汇总
             history: 完整讨论历史
             last_done_reply: 包含哨兵标记的最后一条回复
@@ -1599,10 +1598,6 @@ class HostedMode:
         # auto 模式：提取哨兵标记前的内容作为最终方案
         if arbitrator_name == "auto":
             return extract_before_signal(last_done_reply, self.end_signal)
-
-        # lm_studio 模式：发给本地模型汇总
-        if arbitrator_name == "lm_studio":
-            return await self._lm_studio_summarize(history)
 
         # 指定 AI 模式：先在 ai_list 中查找，再回退到全局 ai_platforms
         target_ai = None
@@ -1640,176 +1635,4 @@ class HostedMode:
             return (f"指定AI汇总失败，回退为原始方案：\n\n"
                     f"{extract_before_signal(last_done_reply, self.end_signal)}")
 
-    # ------------------------------------------------------------------
-    # LM Studio 结案
-    # ------------------------------------------------------------------
 
-    async def _lm_studio_summarize(self, history: list) -> str:
-        """
-        使用 LM Studio 本地模型汇总讨论历史。
-
-        策略：
-        1. 优先用 /v1/completions 端点（纯文本 prompt，无 Jinja 模板渲染）
-           绕过社区模型的 Jinja 模板损坏问题（Error 4028）
-        2. 如果 /v1/completions 不受支持（HTTP 404），回退到 OpenAI SDK
-           的 chat/completions 端点
-
-        Returns:
-            str: 汇总结果
-        """
-        lm = self.config.get("lm_studio", {})
-        if not lm.get("enabled"):
-            return "错误：LM Studio 未启用，无法进行结案汇总。"
-
-        base_url = lm.get("url", "http://127.0.0.1:1234/v1").rstrip("/")
-        summary_prompt = build_summary_prompt(history)
-
-        # 先用 /v1/completions 端点尝试（纯文本，无 Jinja 模板渲染）
-        result = await self._lm_studio_completions(base_url, summary_prompt)
-        if result is not None and not result.startswith("LM Studio"):
-            return result
-
-        # 回退到 OpenAI SDK + chat/completions
-        log_warning("/v1/completions 不可用，回退到 OpenAI SDK chat/completions")
-        return await self._lm_studio_chat_sdk(base_url, summary_prompt)
-
-    async def _lm_studio_completions(
-        self, base_url: str, summary_prompt: str
-    ) -> Optional[str]:
-        """
-        用 /v1/completions 端点调用 LM Studio（纯文本，无 Jinja 模板）。
-
-        Returns:
-            str: 汇总结果，或 None（端点不支持时回退）
-        """
-        import httpx
-        import json
-
-        full_prompt = (
-            "请根据以下讨论历史，输出一份完整的、结构化的最终方案。\n\n"
-            f"{summary_prompt}\n\n"
-            "最终方案："
-        )
-
-        try:
-            async with httpx.AsyncClient(trust_env=False, timeout=120.0) as client:
-                # 获取已加载的模型 ID
-                model_id = ""
-                try:
-                    resp = await client.get(f"{base_url}/models", timeout=5.0)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get("data") and len(data["data"]) > 0:
-                            model_id = data["data"][0].get("id", "")
-                except Exception:
-                    pass
-
-                payload = {
-                    "model": model_id,
-                    "prompt": full_prompt,
-                    "stream": True,
-                    "temperature": 0.7,
-                    "max_tokens": 4096,
-                    "stop": ["<|im_end|>", "<|end|>", "<end_of_turn>"],
-                }
-
-                result_parts = []
-                async with client.stream(
-                    "POST",
-                    f"{base_url}/completions",
-                    json=payload,
-                    timeout=120.0,
-                ) as resp:
-                    if resp.status_code == 404:
-                        return None  # 端点不受支持，回退
-                    if resp.status_code != 200:
-                        error_body = await resp.aread()
-                        return (
-                            f"LM Studio 请求失败 (HTTP {resp.status_code}): "
-                            f"{error_body.decode('utf-8', errors='replace')}"
-                        )
-
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        chunk_data = line[6:].strip()
-                        if chunk_data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(chunk_data)
-                            choices = chunk.get("choices", [])
-                            if not choices:
-                                continue
-                            text = choices[0].get("text", "")
-                            if not text:
-                                text = choices[0].get("delta", {}).get("text", "")
-                                if not text:
-                                    text = choices[0].get("delta", {}).get("content", "")
-                            if text:
-                                result_parts.append(text)
-                        except json.JSONDecodeError:
-                            continue
-
-                full_result = "".join(result_parts).strip()
-                if full_result:
-                    return full_result
-                return "（LM Studio 未返回内容，请检查模型是否已加载）"
-
-        except Exception as e:
-            log_warning(f"/v1/completions 请求异常: {e}")
-            return None  # 异常时回退
-
-    async def _lm_studio_chat_sdk(
-        self, base_url: str, summary_prompt: str
-    ) -> str:
-        """
-        用 OpenAI SDK + chat/completions 端点调用 LM Studio 汇总。
-
-        对大多数模型（含标准 Jinja 模板），SDK 构造的请求体兼容性最好。
-        """
-        lm = self.config.get("lm_studio", {})
-        api_key = lm.get("api_key", "") or "not-needed"
-
-        full_content = (
-            "请根据以下讨论历史，输出一份完整的、结构化的最终方案。\n\n"
-            f"{summary_prompt}\n\n"
-            "最终方案："
-        )
-
-        try:
-            from openai import OpenAI
-            import httpx
-
-            http_client = httpx.Client(trust_env=False, timeout=120.0)
-            client = OpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
-
-            # 获取已加载的模型 ID
-            model_id = ""
-            try:
-                models = client.models.list()
-                model_id = models.data[0].id if models.data else ""
-            except Exception:
-                pass
-
-            # 使用 chat/completions（单条 user 消息 + 一条 assistant 种子消息）
-            # assistant 种子消息提示模型以 assistant 角色开始回答，避免 Jinja 模板
-            # 在角色切换时渲染失败
-            stream = client.chat.completions.create(
-                model=model_id,
-                messages=[
-                    {"role": "user", "content": full_content},
-                ],
-                stream=True,
-                temperature=0.7,
-                max_tokens=4096,
-            )
-
-            result_parts = []
-            for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    result_parts.append(chunk.choices[0].delta.content)
-
-            return "".join(result_parts).strip() or "（LM Studio 未返回内容）"
-
-        except Exception as e:
-            return f"LM Studio 结案失败: {e}\n\n请检查 LM Studio 是否已启动并加载模型。"

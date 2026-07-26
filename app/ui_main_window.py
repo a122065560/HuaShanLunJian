@@ -73,7 +73,7 @@ from logger import (
 # ======================================================================
 
 class SettingsDialog(QDialog):
-    """设置弹窗：AI 平台管理 / LM Studio / 讨论参数 / 开场白 / 日志管理"""
+    """设置弹窗：AI 平台管理 / 讨论参数 / 开场白 / 日志 / 关于"""
 
     def __init__(self, config_mgr: ConfigManager, parent=None):
         super().__init__(parent)
@@ -388,7 +388,7 @@ class SettingsDialog(QDialog):
 
         grid.addWidget(log_group, 0, 1, 1, 2)  # 跨2列
 
-        # ==================== 第二行：讨论参数 | 开场白 | LMStudio ====================
+        # ==================== 第二行：讨论参数 | 开场白 | 关于 ====================
 
         # --- 左下：讨论参数 ---
         disc_group = make_group("💬 讨论参数", self._on_reset_discussion)
@@ -540,50 +540,104 @@ class SettingsDialog(QDialog):
 
         grid.addWidget(opening_group, 1, 1)
 
-        # --- 右下：LM Studio 配置 ---
-        lm_group = make_group("🧠 LM Studio 配置", self._on_reset_lmstudio)
-        lm_layout = QVBoxLayout(lm_group)
-        lm_layout.setContentsMargins(4, 0, 4, 4)
-        lm_layout.setSpacing(2)
-        lm_layout.addWidget(lm_group._title_bar)
+        # --- 右下：关于 ---
+        about_group = make_group("ℹ️ 关于")
+        about_layout = QVBoxLayout(about_group)
+        about_layout.setContentsMargins(4, 0, 4, 4)
+        about_layout.setSpacing(2)
+        about_layout.addWidget(about_group._title_bar)
 
-        lm_form = QFormLayout()
-        lm_form.setSpacing(6)
-        lm_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lm_form.setContentsMargins(8, 0, 8, 0)
-        lm = self.config_mgr.config.get("lm_studio", {})
+        about_content = QWidget()
+        about_content.setStyleSheet("background: transparent;")
+        about_c = QVBoxLayout(about_content)
+        about_c.setContentsMargins(12, 8, 12, 8)
+        about_c.setSpacing(6)
 
-        self.lm_enabled_cb = QCheckBox("启用 LM Studio")
-        self.lm_enabled_cb.setChecked(lm.get("enabled", False))
-        lm_form.addRow(self.lm_enabled_cb)
+        def _about_label(text, bold=False, link=False):
+            lbl = QLabel(text)
+            if link:
+                lbl.setStyleSheet("font-size: 12px; color: #007AFF; background: transparent;")
+                lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+                lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+                lbl.setOpenExternalLinks(True)
+            elif bold:
+                lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #1D1D1F; background: transparent;")
+            else:
+                lbl.setStyleSheet("font-size: 12px; color: #374151; background: transparent;")
+            lbl.setWordWrap(True)
+            return lbl
 
-        self.lm_url_edit = QLineEdit(lm.get("url", "http://127.0.0.1:1234/v1"))
-        self.lm_url_edit.setFixedHeight(24)
-        self.lm_url_edit.setMinimumWidth(160)
-        self.lm_url_edit.setPlaceholderText("http://127.0.0.1:1234/v1")
-        lm_form.addRow("服务地址:", self.lm_url_edit)
+        app_name = _about_label("话山论见 HuaShanLunJian", bold=True)
+        about_c.addWidget(app_name)
 
-        self.lm_name_edit = QLineEdit(lm.get("display_name", "MyAi"))
-        self.lm_name_edit.setFixedHeight(24)
-        self.lm_name_edit.setMinimumWidth(160)
-        self.lm_name_edit.setPlaceholderText("本地模型的显示名称")
-        lm_form.addRow("显示名称:", self.lm_name_edit)
+        version_lbl = _about_label("版本: 0.2.0")
+        about_c.addWidget(version_lbl)
 
-        self.lm_key_edit = QLineEdit(lm.get("api_key", ""))
-        self.lm_key_edit.setFixedHeight(24)
-        self.lm_key_edit.setMinimumWidth(160)
-        self.lm_key_edit.setPlaceholderText("留空则使用 not-needed")
-        lm_form.addRow("API Key:", self.lm_key_edit)
+        desc = _about_label(
+            "多 AI 圆桌协作讨论桌面应用。\n"
+            "可同时操控多个 AI 平台进行多轮讨论，\n"
+            "支持自动结案、日志回溯、用户插话。",
+            bold=False
+        )
+        about_c.addWidget(desc)
 
-        lm_hint = QLabel("💡 用于本地大模型辅助\n（实时摘要 / 追问建议 / 结案汇总）")
-        lm_hint.setStyleSheet("color: #86868B; font-size: 11px; padding: 0 4px;")
-        lm_hint.setWordWrap(True)
-        lm_form.addRow("", lm_hint)
+        # 分隔线
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        sep.setStyleSheet("color: #E5E5EA;")
+        about_c.addWidget(sep)
 
-        lm_layout.addLayout(lm_form)
-        lm_layout.addStretch()
+        license_lbl = _about_label(
+            "本软件完全免费开源，基于 GPL-3.0 许可证发布。\n"
+            "你可自由使用、修改、分发，但须保留相同许可证。",
+            bold=False
+        )
+        about_c.addWidget(license_lbl)
 
-        grid.addWidget(lm_group, 1, 2)
+        # 分隔线
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+        sep2.setStyleSheet("color: #E5E5EA;")
+        about_c.addWidget(sep2)
+
+        dev_lbl = _about_label("开发者信息", bold=True)
+        about_c.addWidget(dev_lbl)
+
+        info_items = [
+            ("👤 开发者", "Damon"),
+            ("📧 邮箱", "122065560@qq.com"),
+            ("📂 GitHub", '<a href="https://github.com/a122065560/HuaShanLunJian" style="color:#007AFF;text-decoration:none;">github.com/a122065560/HuaShanLunJian</a>'),
+        ]
+        for icon, val in info_items:
+            row = QWidget()
+            row.setStyleSheet("background: transparent;")
+            rh = QHBoxLayout(row)
+            rh.setContentsMargins(0, 0, 0, 0)
+            rh.setSpacing(4)
+            icon_lbl = QLabel(icon)
+            icon_lbl.setStyleSheet("font-size: 12px; color: #6B7280; background: transparent;")
+            icon_lbl.setFixedWidth(70)
+            rh.addWidget(icon_lbl)
+            if "href" in val:
+                val_lbl = QLabel(val)
+                val_lbl.setTextFormat(Qt.TextFormat.RichText)
+                val_lbl.setStyleSheet("font-size: 12px; color: #007AFF; background: transparent;")
+                val_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+                val_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+                val_lbl.setOpenExternalLinks(True)
+                rh.addWidget(val_lbl)
+            else:
+                v = _about_label(val)
+                rh.addWidget(v)
+            rh.addStretch()
+            about_c.addWidget(row)
+
+        about_c.addStretch()
+        about_layout.addWidget(about_content)
+
+        grid.addWidget(about_group, 1, 2)
 
         layout.addLayout(grid)
 
@@ -953,10 +1007,6 @@ class SettingsDialog(QDialog):
 
     def _on_save(self):
         """保存所有设置。"""
-        self.config_mgr.set("lm_studio.enabled", self.lm_enabled_cb.isChecked())
-        self.config_mgr.set("lm_studio.url", self.lm_url_edit.text())
-        self.config_mgr.set("lm_studio.display_name", self.lm_name_edit.text())
-        self.config_mgr.set("lm_studio.api_key", self.lm_key_edit.text())
         self.config_mgr.set("discussion.max_rounds", self.rounds_spin.value())
         self.config_mgr.set("discussion.timeout_seconds", self.timeout_spin.value())
         self.config_mgr.set("discussion.start_signal", self.start_signal_edit.text())
@@ -1042,30 +1092,13 @@ class SettingsDialog(QDialog):
         self._show_toast("开场白已恢复默认")
         log_info("已恢复开场白为默认值")
 
-    def _on_reset_lmstudio(self):
-        """恢复 LM Studio 配置为默认值。"""
-        from config_manager import DEFAULT_CONFIG
-        reply = QMessageBox.question(
-            self, "恢复默认",
-            "确定要将 LM Studio 配置恢复为默认值吗？"
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        lm = DEFAULT_CONFIG.get("lm_studio", {})
-        self.lm_enabled_cb.setChecked(lm.get("enabled", False))
-        self.lm_url_edit.setText(lm.get("url", "http://127.0.0.1:1234/v1"))
-        self.lm_name_edit.setText(lm.get("display_name", "MyAi"))
-        self.lm_key_edit.setText(lm.get("api_key", ""))
-        self._show_toast("LM Studio 配置已恢复默认")
-        log_info("已恢复 LM Studio 配置为默认值")
-
     def _on_restore_all_defaults(self):
-        """恢复所有默认配置（包括 AI 平台、讨论参数、LM Studio 等）。
+        """恢复所有默认配置（包括 AI 平台、讨论参数等）。
 
         策略：
         - 默认平台（DeepSeek/智谱清言/通义千问/MiniMax/Kimi/豆包）：恢复为代码中的最新配置
         - 用户手动添加的自定义平台：保留不动
-        - 讨论参数、开场白、LM Studio：恢复默认
+        - 讨论参数、开场白：恢复默认
         - config_version：重置为 DEFAULT_CONFIG_VERSION
         """
         # 先识别用户自定义平台（不在默认平台名列表中的）
@@ -1087,8 +1120,7 @@ class SettingsDialog(QDialog):
             "这将重置：\n"
             "• AI 平台（恢复 DeepSeek、智谱清言、通义千问、MiniMax、Kimi、豆包 的默认选择器）\n"
             "• 讨论参数（轮数、超时、结束标记、结案方）\n"
-            "• 开场白\n"
-            "• LM Studio 配置\n\n"
+            "• 开场白\n\n"
             "你对默认平台的修改将丢失！"
             + custom_msg
         )

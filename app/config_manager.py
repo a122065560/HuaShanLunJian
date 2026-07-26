@@ -61,12 +61,7 @@ DEFAULT_CONFIG = {
         "default_active_ais": ["DeepSeek", "智谱清言"],
         "opening_remarks": "你正在参与一场多AI群聊协作。\n发起话题的是主公，你需遵从主公的旨意。\n请等待主公提出复杂议题（如项目架构、创作大纲等），\n需要你与其他AI展开深度推演：质疑细节、补充边界、提供替代方案。\n请分轮次讨论，不急于给出最终结论。当多方确认讨论充分后，再整合为结构化方案。",
     },
-    "lm_studio": {
-        "enabled": False,
-        "url": "http://127.0.0.1:1234/v1",
-        "display_name": "MyAi",
-        "api_key": "",
-    },
+
     "ai_platforms": [
         {
             "name": "DeepSeek",
@@ -490,11 +485,6 @@ class ConfigManager:
                 errors.append(f"ai_platforms[{i}].selectors.input_textarea 未配置")
             if not selectors.get("send_button"):
                 errors.append(f"ai_platforms[{i}].selectors.send_button 未配置")
-
-        # LM Studio（启用时才校验 URL）
-        lm = self.config.get("lm_studio", {})
-        if lm.get("enabled") and not lm.get("url"):
-            errors.append("lm_studio.url 未配置（LM Studio 已启用）")
 
         return errors
 
