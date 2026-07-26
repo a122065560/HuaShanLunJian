@@ -117,7 +117,7 @@ git tag v1.x.x && git push origin v1.x.x
 - 实现: `browser.py` 的 `_type_message()` 函数
 
 ## 版本规则
-- 当前最新: v1.2.0
-- 下一个 fix/feature: v1.2.1
+- 当前最新: v1.0.0
+- 下一个 fix/feature: v1.0.1
 - **每次修改(修bug/新功能)后，默认只生成本地 .app**（不推送 GitHub）
 - **只有在用户明确说"发版"时，才需要推送到 GitHub Release**
