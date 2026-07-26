@@ -1,0 +1,48 @@
+话山论见 - 多 AI 圆桌协作讨论桌面应用
+Copyright (C) 2024 a122065560
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+【免责声明】
+
+1. 本项目仅供学习交流和研究使用，严禁用于任何商业用途。
+
+2. 本项目为非官方开源工具，与任何 AI 服务提供商（包括但不限于
+   智谱清言、DeepSeek、通义千问等）无任何关联或合作关系。
+
+3. 本项目通过自动化浏览器技术模拟用户操作，使用者需自行评估并
+   承担违反目标网站服务条款可能产生的账号风险或法律风险。
+
+4. 开发者不对使用本项目产生的任何直接或间接后果负责。
+
+【第三方依赖】
+
+- PyQt6 — GNU General Public License v3.0
+  https://www.riverbankcomputing.com/software/pyqt/
+
+- Playwright — Apache License 2.0
+  https://playwright.dev/
+
+- aiohttp — Apache License 2.0
+
+- httpx — BSD 3-Clause License
+
+【致谢】
+
+感谢以下 AI 服务提供商为技术交流提供的平台支持（排名不分先后）：
+智谱清言、DeepSeek、通义千问、MiniMax、Kimi、豆包
+
+感谢所有开源贡献者的卓越工作。

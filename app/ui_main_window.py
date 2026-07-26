@@ -633,6 +633,21 @@ class SettingsDialog(QDialog):
             rh.addStretch()
             about_c.addWidget(row)
 
+        # 分隔线
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setFrameShadow(QFrame.Shadow.Sunken)
+        sep3.setStyleSheet("color: #E5E5EA;")
+        about_c.addWidget(sep3)
+
+        disclaimer_lbl = _about_label(
+            "⚠️ 声明：本项目为非官方开源软件，仅供学习交流，严禁商用。\n"
+            "使用本软件产生的任何后果由用户自行承担。",
+            bold=False
+        )
+        disclaimer_lbl.setStyleSheet("font-size: 11px; color: #9CA3AF; background: transparent;")
+        about_c.addWidget(disclaimer_lbl)
+
         about_c.addStretch()
         about_layout.addWidget(about_content)
 

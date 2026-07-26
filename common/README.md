@@ -4,7 +4,7 @@
 
 **AI 多智能体讨论会议桌——让你的 AI 们开个会**
 
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-ARM64-blue)](https://github.com/a122065560/HuaShanLunJian/releases)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue)](https://github.com/a122065560/HuaShanLunJian/releases)
 
@@ -50,4 +50,25 @@ DeepSeek、智谱、千问、MiniMax、Kimi……这些 AI 各有所长。话山
 
 ---
 
-<div align="center">MIT License · 话山论见 HuaShanLunJian</div>
+## ⚠️ 免责声明与许可协议
+
+**请在使用前仔细阅读以下条款：**
+
+1. **学习交流用途** — 本项目仅供个人学习、研究和技术交流使用。**严禁用于任何商业用途**。
+2. **非官方客户端** — 本项目为第三方开源工具，**非官方出品**，与任何 AI 模型提供商无隶属关系。
+3. **风险自担** — 本项目通过自动化技术模拟网页操作。使用者应当自行评估并承担因使用本工具可能产生的账号风险（如账号被封禁）或法律风险。开发者不承担任何连带责任。
+4. **GPL-3.0 协议**：
+   - 本项目基于 `GPL-3.0` 协议开源。
+   - 这意味着你可以自由地使用、修改和分发本软件，但**任何衍生作品必须同样开源**，且必须保留原作者的版权声明。
+   - 本项目依赖 `PyQt6`，根据其协议要求，本项目必须采用 `GPL-3.0` 或更高版本协议。
+
+## 🙏 致谢
+
+本项目灵感来源于对 AI 协作模式的探索。感谢以下技术支持：
+- [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) — 跨平台 GUI 框架
+- [Playwright](https://playwright.dev/) — 浏览器自动化引擎
+- AI 模型服务：智谱清言、DeepSeek、通义千问、MiniMax、Kimi、豆包（排名不分先后）
+
+---
+
+<div align="center">GPL-3.0 License · 话山论见 HuaShanLunJian</div>
