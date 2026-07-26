@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+app/dist/
+app/build/
+*.spec.bak
+# PyInstaller 自动生成的 spec（HuaShanLunJian.spec 是 Windows CI 用的，需要保留）
+话山论见.spec
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 日志
+*.log
+
+# 用户数据（不应提交）
+*.pfx
+*.key
+.env
+secrets/
+
+# Playwright
+playwright-report/
+test-results/
+
+# 构建产物（build/ 目录）
+build/
+# 项目根目录下的 .app（构建意外输出到根目录时忽略）
+/话山论见.app
+/话山论见-*.dmg
+
+# 临时文件
+tmp/
+temp/

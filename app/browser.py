@@ -1,0 +1,4158 @@
+"""
+browser - 浏览器控制模块
+
+ChromeManager：启动调试模式 Chrome、Playwright CDP 连接、
+消息发送/等待/回复提取、登录检测。
+
+所有浏览器操作均使用 asyncio 异步执行，避免阻塞 Streamlit 主线程。
+"""
+
+import asyncio
+import os
+import platform
+import re
+import socket
+import sys
+from typing import Optional
+
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+
+from utils import clean_text
+from logger import log_info, log_error, log_exception, log_warning, log_ai
+
+
+# ======================================================================
+# Chrome 路径自动检测
+# ======================================================================
+
+def detect_chrome_path() -> Optional[str]:
+    """
+    自动检测系统 Chrome 可执行文件路径。
+
+    Returns:
+        str: Chrome 路径，未找到则 None
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        # macOS 常见路径
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+    elif system == "Windows":
+        candidates = [
+            os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+    else:
+        # Linux
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+
+    return None
+
+
+def is_port_in_use(port: int) -> bool:
+    """检测端口是否被占用。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def wait_for_port(port: int, timeout: int = 15) -> bool:
+    """
+    等待调试端口就绪。
+
+    Returns:
+        bool: 端口是否就绪
+    """
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_port_in_use(port):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# ======================================================================
+# ChromeManager
+# ======================================================================
+
+class ChromeManager:
+    """
+    Chrome 调试模式管理器 + Playwright 控制器。
+
+    职责：
+    1. 启动 / 检测 Chrome 调试模式进程
+    2. 通过 CDP 连接 Playwright
+    3. 发送消息、等待回复、提取回复
+    4. 登录状态检测
+    """
+
+    def __init__(self, config: dict):
+        """
+        Args:
+            config: 完整配置字典（来自 ConfigManager）
+        """
+        self.config = config
+        self._playwright = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
+        self.chrome_path: Optional[str] = detect_chrome_path()
+        # 页面创建锁：防止并发调用 get_or_create_page 导致重复打开页面
+        import asyncio
+        self._page_lock = asyncio.Lock()
+        # 思考模式操作锁：防止同一个 AI 被并发操作（避免无限循环）
+        self._thinking_in_progress = set()  # {ai_name}
+        # 思考模式启用冷却：{ai_name: timestamp}，防止频繁重试启用
+        self._thinking_enable_cooldown = {}
+        # 思考模式连续失败计数：{ai_name: count}
+        self._thinking_fail_count = {}
+        # URL 重定向缓存：{config_url: final_url}，处理跨域重定向
+        self._url_redirect_cache = {}
+        # 对话状态记录：记录工具最后一次对谁说了什么，用于验证提取的回复
+        # {ai_name: {"message": str, "timestamp": float, "type": "init"/"topic"/"reply"}}
+        self._last_sent_to = {}
+        self._last_reply = {}  # 记录每个AI上一次的回复文本，用于检测重复
+
+    def clear_thinking_cache(self, ai_name: str = None):
+        """清除思考模式缓存，使下次状态检查时重新检测。
+
+        Args:
+            ai_name: 指定 AI 名称。如果为 None 则清除所有缓存。
+        """
+        if ai_name:
+            self._thinking_enable_cooldown.pop(ai_name, None)
+            self._thinking_fail_count.pop(ai_name, None)
+        else:
+            self._thinking_enable_cooldown.clear()
+            self._thinking_fail_count.clear()
+
+    # ------------------------------------------------------------------
+    # Chrome 进程管理
+    # ------------------------------------------------------------------
+
+    # LaunchAgent 标识（用于通过 launchd 启动/停止 Chrome）
+    _LAUNCH_AGENT_LABEL = "com.huashanlunjian.chrome"
+    _LAUNCH_AGENT_PLIST = os.path.expanduser(
+        "~/Library/LaunchAgents/com.huashanlunjian.chrome.plist"
+    )
+
+    async def start_chrome_debug_async(self) -> tuple:
+        """
+        启动浏览器调试模式（跨平台）。
+
+        根据配置 browser_mode 选择：
+        - "built-in": 使用 Playwright 内置 Chromium（无需用户安装 Chrome）
+        - "system":   使用系统已安装的 Google Chrome
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        chrome_cfg = self.config.get("chrome", {})
+        browser_mode = chrome_cfg.get("browser_mode", "built-in")
+
+        if browser_mode == "built-in":
+            return await self._start_built_in_browser()
+        else:
+            return await self._start_system_chrome()
+
+    async def _start_built_in_browser(self) -> tuple:
+        """启动 Playwright 内置 Chromium（不依赖系统 Chrome）。"""
+        import subprocess
+
+        chrome_cfg = self.config.get("chrome", {})
+        port = chrome_cfg.get("debug_port", 9222)
+        user_data_dir = chrome_cfg.get("user_data_dir", "")
+        if user_data_dir:
+            user_data_dir = os.path.expanduser(user_data_dir)
+        else:
+            user_data_dir = os.path.expanduser("~/.huashanlunjian/chrome-data")
+
+        # 端口已占用时，浏览器可能已在运行
+        if is_port_in_use(port):
+            log_info(f"浏览器调试端口 {port} 已占用（可能已在运行）")
+            return True, f"浏览器端口 {port} 已就绪（可能已在运行）。"
+
+        os.makedirs(user_data_dir, exist_ok=True)
+
+        # 清除代理环境变量
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                     "http_proxy", "https_proxy", "all_proxy"):
+            os.environ.pop(var, None)
+
+        # 查找 Playwright Chromium 二进制路径
+        # 搜索顺序：PyInstaller 打包目录 → 可执行文件同目录 → 系统缓存目录
+        def _find_bundled_chromium() -> Optional[str]:
+            """在打包目录和系统缓存中查找 Playwright Chromium 可执行文件。"""
+            from pathlib import Path
+
+            def _search_in_dir(base, subpaths):
+                """在 base/chromium-*/ 下按版本从高到低搜索 Chromium。"""
+                base = Path(base)
+                if not base.is_dir():
+                    return None
+                candidates = list(base.glob("chromium-*"))
+                if not candidates:
+                    return None
+                def _ver(p):
+                    try:
+                        return int(p.name.split("-")[-1])
+                    except (ValueError, IndexError):
+                        return 0
+                for c in sorted(candidates, key=_ver, reverse=True):
+                    for sub in subpaths:
+                        exe = c / sub
+                        if exe.exists():
+                            log_info(f"找到 Playwright Chromium: {exe}")
+                            return str(exe)
+                return None
+
+            # 确定各平台子路径
+            if sys.platform == 'darwin':
+                subpaths = [
+                    "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+                ]
+                system_caches = [
+                    os.path.expanduser("~/Library/Caches/ms-playwright"),
+                    os.path.join(os.path.expanduser("~/Library/Caches/HuaShanLunJian"), "browsers"),
+                ]
+            elif sys.platform == 'win32':
+                subpaths = ["chrome-win64/chrome.exe"]
+                _la = os.environ.get("LOCALAPPDATA", "")
+                system_caches = [
+                    os.path.join(_la, "ms-playwright"),
+                    os.path.join(_la, "HuaShanLunJian", "browsers"),
+                ]
+            else:
+                subpaths = ["chrome-linux/chrome"]
+                system_caches = [
+                    os.path.expanduser("~/.cache/ms-playwright"),
+                    os.path.join(os.path.expanduser("~/.cache/HuaShanLunJian"), "browsers"),
+                ]
+
+            # 1. PyInstaller 打包环境：查找 _MEIPASS 内的 Chromium
+            #    同时搜索 .local-browsers（带点，build_dmg.sh 复制位置）
+            #    和 local-browsers（不带点，PLAYWRIGHT_BROWSERS_PATH=0 默认位置）
+            if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
+                meipass = Path(sys._MEIPASS)
+                for bd in [
+                    meipass / 'playwright' / 'driver' / 'package' / '.local-browsers',
+                    meipass / 'playwright' / 'driver' / 'package' / 'local-browsers',
+                    meipass / '.local-browsers',
+                ]:
+                    result = _search_in_dir(bd, subpaths)
+                    if result:
+                        return result
+
+            # 2. 可执行文件同目录（onedir 模式）
+            exe_dir = Path(sys.executable).parent
+            for rel in [
+                '_internal/playwright/driver/package/.local-browsers',
+                '_internal/playwright/driver/package/local-browsers',
+                'playwright/driver/package/.local-browsers',
+                'playwright/driver/package/local-browsers',
+                'Frameworks/playwright/driver/package/.local-browsers',
+                'Frameworks/playwright/driver/package/local-browsers',
+                'Resources/playwright/driver/package/.local-browsers',
+                'Resources/playwright/driver/package/local-browsers',
+            ]:
+                result = _search_in_dir(exe_dir / rel, subpaths)
+                if result:
+                    return result
+
+            # 3. 系统缓存目录（开发环境或用户手动安装）
+            for cache_dir in system_caches:
+                result = _search_in_dir(cache_dir, subpaths)
+                if result:
+                    return result
+
+            return None
+
+        def _try_download_chromium() -> Optional[str]:
+            """未找到 Chromium 时，尝试通过 Playwright driver 自动下载到用户可写目录。"""
+            import subprocess
+
+            # 确定用户可写的下载目录
+            if sys.platform == 'win32':
+                dl_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "HuaShanLunJian", "browsers")
+            elif sys.platform == 'darwin':
+                dl_dir = os.path.expanduser("~/Library/Caches/HuaShanLunJian/browsers")
+            else:
+                dl_dir = os.path.expanduser("~/.cache/HuaShanLunJian/browsers")
+            os.makedirs(dl_dir, exist_ok=True)
+
+            # 查找 Playwright driver（node + cli.js）
+            if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
+                base = sys._MEIPASS
+            else:
+                import playwright as _pw
+                base = os.path.dirname(_pw.__file__)
+            node_name = "node.exe" if sys.platform == 'win32' else "node"
+            node_exe = os.path.join(base, "playwright", "driver", "package", node_name)
+            if not os.path.isfile(node_exe):
+                node_exe = os.path.join(base, "driver", "package", node_name)
+            cli_js = os.path.join(os.path.dirname(node_exe), "cli.js")
+
+            if not os.path.isfile(node_exe) or not os.path.isfile(cli_js):
+                log_warning(f"Playwright driver 未找到: node={node_exe}, cli={cli_js}")
+                return None
+
+            try:
+                log_info(f"正在下载 Chromium 到 {dl_dir}...")
+                env = os.environ.copy()
+                env["PLAYWRIGHT_BROWSERS_PATH"] = dl_dir
+                result = subprocess.run(
+                    [node_exe, cli_js, "install", "chromium"],
+                    capture_output=True, text=True, timeout=180, env=env
+                )
+                if result.returncode == 0:
+                    log_info("Chromium 下载完成，重新搜索...")
+                    return _find_bundled_chromium()
+                else:
+                    log_warning(f"Chromium 下载失败: {result.stderr[:300]}")
+                    return None
+            except Exception as e:
+                log_warning(f"下载 Chromium 异常: {e}")
+                return None
+
+        chromium_exe = _find_bundled_chromium()
+
+        # 未找到 Chromium 时尝试自动下载（回退机制）
+        if not chromium_exe:
+            chromium_exe = _try_download_chromium()
+
+        # 仍未找到内置 Chromium 时，回退到系统 Chrome（用户已安装的 Google Chrome）
+        # 这样即使打包时未包含 Chromium，内置浏览器也能正常工作
+        if not chromium_exe:
+            chromium_exe = _find_system_chrome()
+            if chromium_exe:
+                log_info(f"未找到内置 Chromium，回退到系统 Chrome: {chromium_exe}")
+            else:
+                log_warning("未找到内置 Chromium，也未找到系统 Chrome，Playwright 将使用默认路径（可能失败）")
+
+        # 设置 Playwright 浏览器搜索路径（打包环境：使用包内浏览器）
+        # PLAYWRIGHT_BROWSERS_PATH=0 让 Playwright 在 driver/package/local-browsers 查找
+        # 同时检查 .local-browsers（带点）和 local-browsers（不带点）两种命名
+        if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
+            for bdir_name in ['.local-browsers', 'local-browsers']:
+                bundle_browsers = os.path.join(
+                    sys._MEIPASS, 'playwright', 'driver', 'package', bdir_name
+                )
+                if os.path.isdir(bundle_browsers):
+                    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '0'
+                    break
+
+        try:
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
+
+            log_info(f"启动内置 Chromium: 端口 {port}, 数据目录 {user_data_dir}, exe={chromium_exe or '默认'}")
+
+            launch_kwargs = dict(
+                user_data_dir=user_data_dir,
+                headless=False,
+                args=[
+                    f"--remote-debugging-port={port}",
+                    "--remote-allow-origins=*",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--no-proxy-server",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+                no_viewport=True,
+            )
+            if chromium_exe:
+                launch_kwargs["executable_path"] = chromium_exe
+
+            self._context = await asyncio.wait_for(
+                self._playwright.chromium.launch_persistent_context(
+                    **launch_kwargs
+                ),
+                timeout=15
+            )
+
+            # 拿到 browser 引用
+            self._browser = self._context.browser
+            log_info(f"内置 Chromium 已启动（端口 {port}）")
+            return True, f"内置浏览器已启动（端口 {port}）。"
+
+        except asyncio.TimeoutError:
+            log_error("内置 Chromium 启动超时（15秒）")
+            self._context = None
+            self._browser = None
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+            return False, "内置浏览器启动超时，请重试或检查网络代理设置"
+        except Exception as e:
+            log_exception("内置 Chromium 启动异常", type(e), e, e.__traceback__)
+            self._context = None
+            self._browser = None
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+            return False, f"内置浏览器启动失败: {e}"
+
+    async def _start_system_chrome(self) -> tuple:
+        """启动系统 Google Chrome 调试模式。"""
+        import subprocess
+
+        chrome_cfg = self.config.get("chrome", {})
+        port = chrome_cfg.get("debug_port", 9222)
+        user_data_dir = chrome_cfg.get("user_data_dir", "")
+
+        # 展开路径
+        if user_data_dir:
+            user_data_dir = os.path.expanduser(user_data_dir)
+        else:
+            user_data_dir = os.path.expanduser("~/.huashanlunjian/chrome-data")
+
+        # 端口已占用时，可能 Chrome 已在运行
+        if is_port_in_use(port):
+            log_info(f"Chrome 调试端口 {port} 已占用（可能已在运行）")
+            return True, f"Chrome 调试端口 {port} 已就绪（可能已在运行）。"
+
+        # 确保用户数据目录存在
+        os.makedirs(user_data_dir, exist_ok=True)
+
+        # 检测 Chrome 路径（跨平台）
+        chrome_path = self.chrome_path or detect_chrome_path()
+        if not chrome_path or not os.path.isfile(chrome_path):
+            return False, "未找到 Google Chrome，请确认已安装。"
+
+        # Chrome 启动参数（通用）
+        chrome_args = [
+            chrome_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
+            "--remote-allow-origins=*",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--silent-launch",
+            # 绕过系统代理（Clash 等），否则 AI 网页的 API 调用会走代理导致失败
+            "--no-proxy-server",
+        ]
+
+        if sys.platform == 'darwin':
+            # macOS: 通过 LaunchAgent 启动（避免 TCC 权限问题）
+            import plistlib
+
+            plist_content = {
+                "Label": self._LAUNCH_AGENT_LABEL,
+                "ProgramArguments": chrome_args,
+                "RunAtLoad": True,
+                "StandardOutPath": "/tmp/rt-chrome-stdout.log",
+                "StandardErrorPath": "/tmp/rt-chrome-stderr.log",
+            }
+
+            os.makedirs(os.path.dirname(self._LAUNCH_AGENT_PLIST), exist_ok=True)
+
+            # 如果有旧的 plist，先 unload
+            if os.path.exists(self._LAUNCH_AGENT_PLIST):
+                try:
+                    subprocess.run(
+                        ["launchctl", "unload", self._LAUNCH_AGENT_PLIST],
+                        timeout=5, capture_output=True
+                    )
+                except Exception:
+                    pass
+
+            with open(self._LAUNCH_AGENT_PLIST, "wb") as f:
+                plistlib.dump(plist_content, f)
+
+            log_info(f"启动 Chrome (LaunchAgent): 端口 {port}, 数据目录 {user_data_dir}")
+
+            try:
+                subprocess.run(
+                    ["launchctl", "load", self._LAUNCH_AGENT_PLIST],
+                    check=True, timeout=10, capture_output=True
+                )
+            except Exception as e:
+                log_exception("Chrome 启动异常", type(e), e, e.__traceback__)
+                return False, f"Chrome 启动失败: {e}"
+        else:
+            # Windows / Linux: 直接启动
+            log_info(f"启动 Chrome: 端口 {port}, 数据目录 {user_data_dir}")
+
+            try:
+                if sys.platform == 'win32':
+                    # Windows: CREATE_NO_WINDOW 隐藏控制台
+                    # 注意：不用 DETACHED_PROCESS，会触发 WinError 740（需要提升权限）
+                    CREATE_NEW_PROCESS_GROUP = 0x00000200
+                    CREATE_NO_WINDOW = 0x08000000
+                    try:
+                        subprocess.Popen(
+                            chrome_args,
+                            creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except OSError:
+                        # WinError 740 降级：不带 creationflags 重试
+                        subprocess.Popen(
+                            chrome_args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                else:
+                    # Linux
+                    subprocess.Popen(
+                        chrome_args,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+            except Exception as e:
+                log_exception("Chrome 启动异常", type(e), e, e.__traceback__)
+                return False, f"Chrome 启动失败: {e}"
+
+        # 等待端口就绪
+        if not wait_for_port(port, timeout=20):
+            log_error(f"Chrome 启动后端口 {port} 未就绪")
+            return False, f"Chrome 启动后端口 {port} 未就绪，请检查。"
+
+        log_info(f"Chrome 调试模式已启动（端口 {port}）")
+        return True, f"Chrome 调试模式已启动（端口 {port}）。"
+
+    def is_chrome_running(self) -> bool:
+        """检测 Chrome 调试端口是否可用。"""
+        port = self.config.get("chrome", {}).get("debug_port", 9222)
+        return is_port_in_use(port)
+
+    def is_browser_alive(self) -> bool:
+        """检测内置浏览器（Playwright context/browser）是否仍然存活。
+
+        用于区分"页面被用户关闭"和"浏览器整体关闭"：
+        - 返回 True：浏览器存活，页面可重建（仅页面被关闭）
+        - 返回 False：浏览器已关闭，页面无法重建，应停止讨论
+        """
+        # 系统浏览器模式：检查 Chrome 调试端口
+        browser_mode = self.config.get("chrome", {}).get("browser_mode", "built-in")
+        if browser_mode == "system":
+            return self.is_chrome_running()
+        # 内置浏览器模式：检查 Playwright context 是否存在且可用
+        if self._context is None and self._browser is None:
+            return False
+        return True
+
+    def is_page_open(self, url: str) -> bool:
+        """
+        检测指定 URL 的页面是否仍然打开着。
+
+        通过 CDP HTTP 接口查询已打开的标签页列表。
+        使用域名级匹配 + 重定向缓存，避免重定向导致 URL 变化后误判。
+        """
+        if not self.is_chrome_running():
+            return False
+
+        port = self.config.get("chrome", {}).get("debug_port", 9222)
+        try:
+            import urllib.request
+            import json as _json
+            from urllib.parse import urlparse
+            resp = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/list", timeout=2
+            )
+            tabs = _json.loads(resp.read())
+            # 收集所有要匹配的域名
+            config_domain = urlparse(url).netloc if url else ""
+            # 也检查重定向缓存中的域名
+            domains_to_check = {config_domain}
+            final_url = self._url_redirect_cache.get(url)
+            if final_url:
+                domains_to_check.add(urlparse(final_url).netloc)
+            domains_to_check.discard("")
+
+            for tab in tabs:
+                if tab.get("type") != "page":
+                    continue
+                tab_url = tab.get("url", "")
+                tab_domain = urlparse(tab_url).netloc
+                if tab_domain in domains_to_check:
+                    return True
+                # 回退到包含匹配
+                if url in tab_url:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    async def async_stop_built_in(self):
+        """在内置浏览器模式下，异步关闭 Playwright context 和 browser。
+        必须在事件循环线程中调用（如大脑线程的 asyncio 循环）。
+        """
+        # 0. 清除文件上传缓存（浏览器关闭后页面引用全部失效）
+        self._uploaded_pages = set()
+
+        # 1. 关闭 context（会关闭所有页面）
+        if self._context is not None:
+            try:
+                await self._context.close()
+                log_info("内置浏览器 context 已异步关闭")
+            except Exception as e:
+                log_warning(f"异步关闭 context 失败: {e}")
+            self._context = None
+
+        # 2. 关闭 browser
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+                log_info("内置浏览器 browser 已异步关闭")
+            except Exception as e:
+                log_warning(f"异步关闭 browser 失败: {e}")
+            self._browser = None
+
+        # 3. 停止 Playwright
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+                log_info("Playwright 已异步停止")
+            except Exception as e:
+                log_warning(f"异步停止 Playwright 失败: {e}")
+            self._playwright = None
+
+    def stop_chrome(self):
+        """
+        停止浏览器调试进程（跨平台）。
+
+        内置浏览器模式：关闭 Playwright persistent context + browser
+        系统Chrome模式：launchctl unload / taskkill / pkill
+        """
+        import subprocess
+        import time
+
+        port = self.config.get("chrome", {}).get("debug_port", 9222)
+        browser_mode = self.config.get("chrome", {}).get("browser_mode", "built-in")
+
+        # 内置浏览器模式：Playwright context 是异步对象，不能在同步线程中关闭
+        # 只清理引用，真正的异步关闭由 async_stop_built_in() 完成
+        if browser_mode == "built-in":
+            self._context = None
+            self._browser = None
+            self._playwright = None
+            log_info("内置浏览器引用已清理（异步关闭由 async_stop_built_in 完成）")
+
+        # 内置浏览器模式：Playwright API 关闭后，端口通常已释放
+        if not is_port_in_use(port):
+            log_info(f"浏览器端口 {port} 已释放")
+            return
+
+        # 系统Chrome模式 或 内置浏览器未正常关闭时的后备清理
+        if sys.platform == 'darwin':
+            # macOS: 通过 launchctl unload 让 launchd 终止 Chrome
+            if os.path.exists(self._LAUNCH_AGENT_PLIST):
+                try:
+                    subprocess.run(
+                        ["launchctl", "unload", self._LAUNCH_AGENT_PLIST],
+                        timeout=3, capture_output=True
+                    )
+                    log_info("Chrome 已通过 launchctl unload 停止")
+                except Exception as e:
+                    log_warning(f"launchctl unload 失败: {e}")
+
+            # 等待端口释放（最多 2 秒）
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                if not is_port_in_use(port):
+                    break
+                time.sleep(0.3)
+
+            # 后备：pkill
+            if is_port_in_use(port):
+                try:
+                    subprocess.run(
+                        ["pkill", "-f", f"remote-debugging-port={port}"],
+                        timeout=3, capture_output=True
+                    )
+                    log_info(f"Chrome 已通过 pkill 强制关闭 (port={port})")
+                    time.sleep(0.5)
+                except Exception as e:
+                    log_warning(f"pkill 关闭 Chrome 失败: {e}")
+        elif sys.platform == 'win32':
+            # Windows: 用 taskkill 终止带特定端口的 Chrome 进程
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                    timeout=10, capture_output=True
+                )
+                log_info("Chrome 已通过 taskkill 停止")
+                time.sleep(1)
+            except Exception as e:
+                log_warning(f"taskkill 关闭 Chrome 失败: {e}")
+        else:
+            # Linux
+            try:
+                subprocess.run(
+                    ["pkill", "-f", f"remote-debugging-port={port}"],
+                    timeout=5, capture_output=True
+                )
+                log_info(f"Chrome 已通过 pkill 关闭 (port={port})")
+                time.sleep(1)
+            except Exception as e:
+                log_warning(f"pkill 关闭 Chrome 失败: {e}")
+
+    # ------------------------------------------------------------------
+    # Playwright 连接
+    # ------------------------------------------------------------------
+
+    async def connect_playwright(self, max_retries: int = 3) -> Browser:
+        """
+        获取 Playwright Browser 实例。
+
+        优先使用 launch_persistent_context 启动的浏览器；
+        如果 Chrome 是外部启动的，则通过 CDP 连接。
+
+        Returns:
+            Browser: Playwright Browser 实例
+
+        Raises:
+            ConnectionError: 连接失败
+        """
+        # 如果有 persistent context，直接返回其 Browser
+        if self._context is not None:
+            try:
+                browser = self._context.browser
+                if browser is not None:
+                    return browser
+            except Exception:
+                pass
+
+        if self._browser is not None:
+            try:
+                _ = self._browser.contexts
+                return self._browser
+            except Exception:
+                self._browser = None
+
+        # 清除代理环境变量
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                     "http_proxy", "https_proxy", "all_proxy"):
+            os.environ.pop(var, None)
+
+        port = self.config.get("chrome", {}).get("debug_port", 9222)
+        cdp_url = f"http://127.0.0.1:{port}"
+
+        log_info(f"Playwright CDP 连接: {cdp_url}")
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                if self._playwright is None:
+                    self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+                log_info("Playwright CDP 连接成功")
+                return self._browser
+            except Exception as e:
+                last_error = e
+                log_warning(f"Playwright 连接尝试 {attempt + 1}/{max_retries} 失败: {e}")
+                await asyncio.sleep(1)
+
+        raise ConnectionError(
+            f"Playwright 连接 Chrome 失败（重试 {max_retries} 次）: {last_error}。"
+            f"请确认 Chrome 调试模式已启动。"
+        )
+
+    async def get_or_create_page(self, url: str) -> Page:
+        """
+        获取已打开该 URL 的页面，或新建并导航。
+
+        使用锁保护，防止并发调用导致重复打开页面。
+        导航完成后，通过 osascript 将本应用拉回前台，
+        防止 Chrome 抢占台前显示。
+
+        Args:
+            url: 目标 AI 平台 URL
+
+        Returns:
+            Page: Playwright Page 对象
+        """
+        async with self._page_lock:
+            # 优先使用 persistent context
+            if self._context is not None:
+                for page in self._context.pages:
+                    try:
+                        if self._url_matches_with_redirect(url, page.url):
+                            log_info(f"找到已打开的页面: {page.url}")
+                            await self._bring_app_to_front()
+                            return page
+                    except Exception:
+                        continue
+                # 新建页面
+                log_info(f"新建页面并导航到: {url}")
+                page = await self._context.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2000)
+                log_info(f"页面已加载: {url}")
+                self._bring_app_to_front()
+                return page
+
+            # CDP 回退
+            browser = await self.connect_playwright()
+
+            for context in browser.contexts:
+                for page in context.pages:
+                    try:
+                        if self._url_matches_with_redirect(url, page.url):
+                            log_info(f"找到已打开的页面: {page.url}")
+                            self._bring_app_to_front()
+                            return page
+                    except Exception:
+                        continue
+
+            log_info(f"新建页面并导航到: {url}")
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = await context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+            # 记录重定向后的最终 URL（处理跨域重定向）
+            try:
+                final_url = page.url
+                if final_url and final_url != url:
+                    from urllib.parse import urlparse
+                    config_domain = urlparse(url).netloc
+                    final_domain = urlparse(final_url).netloc
+                    if config_domain != final_domain:
+                        log_info(f"检测到跨域重定向: {url} → {final_url}")
+                        self._url_redirect_cache[url] = final_url
+            except Exception:
+                pass
+            log_info(f"页面已加载: {url}")
+            await self._bring_app_to_front()
+            return page
+
+    async def _bring_app_to_front(self):
+        """将本应用拉回前台（跨平台，异步，不阻塞事件循环）。"""
+        try:
+            if sys.platform == 'darwin':
+                # macOS: osascript
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", 'tell application "话山论见" to activate',
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            # Windows/Linux: 不需要特殊处理，Qt 窗口会自动获得焦点
+        except Exception as e:
+            log_warning(f"拉回前台失败: {e}")
+
+    @staticmethod
+    def _url_matches(config_url: str, page_url: str) -> bool:
+        """
+        判断页面 URL 是否匹配配置 URL。
+
+        采用域名级匹配，避免路径差异导致重复打开。
+        例如配置 https://chat.deepseek.com/ 能匹配 https://chat.deepseek.com/sign_in
+
+        Args:
+            config_url: 配置中的平台 URL
+            page_url: 浏览器中实际的页面 URL
+
+        Returns:
+            bool: 是否匹配
+        """
+        if not config_url or not page_url:
+            return False
+        # 提取域名进行比较
+        try:
+            from urllib.parse import urlparse
+            config_domain = urlparse(config_url).netloc
+            page_domain = urlparse(page_url).netloc
+            if config_domain and page_domain:
+                return config_domain == page_domain
+        except Exception:
+            pass
+        # 回退到包含匹配
+        return config_url in page_url
+
+    def _url_matches_with_redirect(self, config_url: str, page_url: str) -> bool:
+        """
+        判断页面 URL 是否匹配配置 URL（含重定向缓存检查）。
+
+        在 _url_matches 基础上，额外检查重定向缓存中记录的最终域名。
+        """
+        if self._url_matches(config_url, page_url):
+            return True
+        # 检查重定向缓存
+        final_url = self._url_redirect_cache.get(config_url)
+        if final_url and self._url_matches(final_url, page_url):
+            return True
+        return False
+
+    async def close_page(self, url: str) -> bool:
+        """
+        关闭已打开的指定 URL 的页面。
+
+        使用与 get_or_create_page 相同的 _url_matches_with_redirect 匹配策略
+        （域名级匹配 + 重定向缓存），确保跨域重定向后仍能正确找到并关闭页面。
+
+        Args:
+            url: 目标 AI 平台 URL
+
+        Returns:
+            bool: 是否成功关闭
+        """
+        try:
+            closed = False
+
+            # 优先使用 persistent context
+            if self._context is not None:
+                for page in self._context.pages:
+                    try:
+                        if self._url_matches_with_redirect(url, page.url):
+                            await page.close()
+                            log_info(f"已关闭页面: {url} (实际: {page.url})")
+                            closed = True
+                    except Exception:
+                        continue
+                return closed
+
+            # CDP 回退
+            browser = await self.connect_playwright()
+            for context in browser.contexts:
+                for page in context.pages:
+                    try:
+                        if self._url_matches_with_redirect(url, page.url):
+                            await page.close()
+                            log_info(f"已关闭页面: {url} (实际: {page.url})")
+                            closed = True
+                    except Exception:
+                        continue
+            return closed
+        except Exception as e:
+            log_warning(f"关闭页面失败: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # 新对话 / 消息发送 / 等待 / 提取
+    # ------------------------------------------------------------------
+
+    async def start_new_chat(self, page: Page, ai_config: dict) -> bool:
+        """
+        在 AI 平台上开启新对话。
+
+        策略：
+        1. 尝试点击"新对话"/"新建对话"按钮
+        2. 如果找不到按钮，重新导航到平台 URL
+
+        Args:
+            page: Playwright Page
+            ai_config: AI 平台配置
+
+        Returns:
+            bool: 是否成功开启新对话
+        """
+        ai_name = ai_config.get("name", "")
+        url = ai_config.get("url", "")
+
+        # 新对话按钮选择器（多种平台兼容）
+        new_chat_selectors = [
+            # DeepSeek
+            "div[role='button']:has-text('新建对话')",
+            "button:has-text('新建对话')",
+            "a:has-text('新建对话')",
+            "div[class*='new']:has-text('新')",
+            # 智谱清言
+            "div:has-text('新对话')",
+            "button:has-text('新对话')",
+            # 通用
+            "button:has-text('New Chat')",
+            "button:has-text('新建')",
+            "a[href*='new']",
+            "[class*='new-chat']",
+            "[class*='newChat']",
+        ]
+
+        try:
+            for selector in new_chat_selectors:
+                try:
+                    el = page.locator(selector).first
+                    if await el.is_visible(timeout=2000):
+                        await el.click()
+                        await page.wait_for_timeout(2000)
+                        log_info(f"[{ai_name}] 通过按钮开启新对话: {selector}")
+                        return True
+                except Exception:
+                    continue
+
+            # 没找到按钮，重新导航
+            log_info(f"[{ai_name}] 未找到新对话按钮，重新导航到 {url}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            log_info(f"[{ai_name}] 已重新导航，开启新对话")
+            return True
+
+        except Exception as e:
+            log_warning(f"[{ai_name}] 开启新对话失败: {e}")
+            return False
+
+    async def send_and_wait(self, page: Page, message: str,
+                            ai_config: dict, timeout: int = 300,
+                            fast_wait: bool = False,
+                            force_file_upload: bool = False,
+                            file_recently_uploaded: bool = False) -> str:
+        """
+        发送消息并等待 AI 回复完成，提取最新回复纯文本。
+
+        流程：
+        1. （可选）上传文件
+        2. 定位输入框并填充消息
+        3. 点击发送按钮（多种策略）
+        4. 主策略：等待"停止生成"按钮消失（AI 输出完成）
+        5. 备选策略：内容稳定检测（连续3次内容不变）
+        6. 提取最新一条回复的纯文本
+
+        Args:
+            page: Playwright Page
+            message: 要发送的消息文本
+            ai_config: AI 平台配置（含 selectors）
+            timeout: 单轮最大等待秒数
+            fast_wait: 是否使用快速等待模式
+            force_file_upload: 是否强制使用文件上传方式发送消息（避免文字过长导致AI平台罢工）
+            file_recently_uploaded: 是否刚上传过文件（外部上传，非本函数内上传）。
+                为 True 时使用 keyboard.type() 输入，避免 execCommand 无法触发框架状态更新。
+
+        Returns:
+            str: AI 回复的纯文本
+
+        Raises:
+            TimeoutError: 等待回复超时
+            Exception: 发送或提取失败
+        """
+        selectors = ai_config.get("selectors", {})
+        input_selector = selectors.get("input_textarea", "textarea")
+        send_selector = selectors.get("send_button", "button[type='submit']")
+        send_button_selectors = selectors.get("send_button_selectors", [])
+        stop_selector = selectors.get("stop_button", "")
+        last_response_selector = selectors.get("last_response", "")
+
+        timeout_ms = timeout * 1000
+        ai_name = ai_config.get("name", "未知")
+        # 标记消息是否已成功发送到聊天框（用于区分"发送前失败"和"发送后失败"）
+        # 发送后失败时不应重发消息，否则会导致开场白重复
+        message_sent = False
+
+        # 检查页面是否已关闭，如果关闭则尝试重新获取
+        try:
+            if page.is_closed():
+                # 先检查浏览器是否存活（区分"页面被关"和"浏览器整体被关"）
+                if not self.is_browser_alive():
+                    raise Exception(f"{ai_name} 页面已关闭且浏览器不可用（BROWSER_CLOSED）")
+                log_warning(f"[{ai_name}] 页面已关闭，尝试重新获取页面...")
+                page = await self.get_or_create_page(ai_config["url"])
+                if page.is_closed():
+                    raise Exception(f"页面重新获取失败: {ai_name} 页面仍然关闭")
+                log_info(f"[{ai_name}] 页面重新获取成功")
+        except Exception as e:
+            # 如果已经是 BROWSER_CLOSED 错误，直接向上抛
+            if "BROWSER_CLOSED" in str(e):
+                raise
+            if "Target page" in str(e) or "has been closed" in str(e) or page.is_closed():
+                # 检查浏览器是否存活
+                if not self.is_browser_alive():
+                    raise Exception(f"{ai_name} 浏览器已关闭（BROWSER_CLOSED）")
+                log_warning(f"[{ai_name}] 页面不可用({e})，尝试重新获取...")
+                try:
+                    page = await self.get_or_create_page(ai_config["url"])
+                    log_info(f"[{ai_name}] 页面重新获取成功")
+                except Exception as e2:
+                    if not self.is_browser_alive():
+                        raise Exception(f"{ai_name} 浏览器已关闭（BROWSER_CLOSED）")
+                    raise Exception(f"页面不可用且重新获取失败: {e2}")
+
+        try:
+            # 0.5 记录发送前的状态（页面内容长度 + 回复区块数 + 复制按钮数）
+            state_before = await page.evaluate("""() => {
+                const selectors = '.ds-markdown--content, div[class*="message-content"], div[class*="markdown-body"], div[class*="message__content"], div[class*="answer-content"], div[class*="reply-content"], div[class*="bubble"], div[data-role="assistant"]';
+                const els = document.querySelectorAll(selectors);
+
+                // 统计复制按钮数量（多策略，覆盖所有6个AI平台）
+                function countCopyButtons() {
+                    const found = new Set();
+                    // 策略1: aria-label 含"复制"/"copy"
+                    document.querySelectorAll('[aria-label]').forEach(el => {
+                        const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                        if (label === '复制' || label === 'copy' || label.includes('复制') || label.includes('copy')) {
+                            if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                                found.add(el);
+                            }
+                        }
+                    });
+                    // 策略2: 文字"复制"的按钮
+                    document.querySelectorAll('button, [role="button"], [class*="icon-button"], [class*="action"]').forEach(el => {
+                        const text = (el.textContent || '').trim();
+                        if (text === '复制' || text === 'Copy') {
+                            found.add(el);
+                        }
+                    });
+                    // 策略3: class 含"copy"
+                    document.querySelectorAll('[class*="copy" i]').forEach(el => {
+                        if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                            found.add(el);
+                        }
+                    });
+                    // 策略4: 回复区块底部工具栏的第一个按钮（豆包/DeepSeek 等无文字标识的平台）
+                    const footerSelectors = [
+                        '.ds-markdown--footer',
+                        '[class*="message-action-bar"]',
+                        '[class*="message-footer"]',
+                        '[class*="answer-footer"]',
+                        '[class*="segment-assistant-actions"]',
+                        '[class*="chat-action"]',
+                        '[class*="msg-action"]',
+                        '[class*="reply-action"]',
+                        '[class*="footer-action"]',
+                    ];
+                    footerSelectors.forEach(sel => {
+                        try {
+                            document.querySelectorAll(sel).forEach(bar => {
+                                const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"]');
+                                if (btns.length > 0) {
+                                    // 取第一个按钮作为复制按钮（排除"朗读"）
+                                    for (const btn of btns) {
+                                        const aria = (btn.getAttribute('aria-label') || '').trim();
+                                        const text = (btn.textContent || '').trim();
+                                        if (aria !== '朗读' && aria !== 'Read aloud' && text !== '朗读') {
+                                            found.add(btn);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        } catch(e) {}
+                    });
+                    return found.size;
+                }
+
+                return {
+                    count: els.length,
+                    content_len: document.body.innerText.length,
+                    copy_btn_count: countCopyButtons(),
+                };
+            }""")
+            reply_count_before = state_before.get("count", 0)
+            content_len_before = state_before.get("content_len", 0)
+            copy_btn_count_before = state_before.get("copy_btn_count", 0)
+            log_info(f"[{ai_name}] 发送前状态: 回复区块={reply_count_before}, 内容长度={content_len_before}, 复制按钮={copy_btn_count_before}")
+
+            # 1. 定位输入框并填充（带重试，粘贴文件后页面可能重渲染）
+            # 统一策略：20字以内直接逐字输入，20字以上前20字逐字输入+剩余转txt文件
+            # 避免粘贴操作导致千问 Slate.js 等框架异常
+            TEXT_HEAD_LEN = 20  # 前20字逐字键盘输入
+
+            file_content = None      # 写入txt文件的内容（None=不上传文件）
+            text_after_upload = message  # 文件上传后发送的文字消息（默认=原始消息）
+
+            if len(message) > TEXT_HEAD_LEN:
+                # 超过20字：前20字逐字输入 + 剩余部分转txt文件
+                file_content = message[TEXT_HEAD_LEN:]
+                text_after_upload = message[:TEXT_HEAD_LEN] + "\n\n[后续内容请见上传的文件]"
+
+            # 向后兼容：force_file_upload 参数（强制全部转文件）
+            if force_file_upload:
+                file_content = message
+                text_after_upload = "请先阅读上传的文件内容，然后根据文件中的内容进行回复。"
+
+            need_file_upload = file_content is not None
+            file_just_uploaded = False  # 标记刚上传了文件，需要用 keyboard.type 而非 execCommand
+            if need_file_upload:
+                import time as _time_for_file
+                if force_file_upload:
+                    log_info(f"[{ai_name}] 强制文件上传模式")
+                else:
+                    log_info(f"[{ai_name}] 消息{len(message)}字 > {TEXT_HEAD_LEN}字，前{TEXT_HEAD_LEN}字逐字输入 + 剩余{len(file_content)}字转文件")
+                import os
+                # 创建临时txt文件
+                tmp_dir = os.path.expanduser("~/.huashanlunjian/temp")
+                os.makedirs(tmp_dir, exist_ok=True)
+                tmp_file = os.path.join(tmp_dir, f"prompt_{ai_name}_{int(_time_for_file.time())}.txt")
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    f.write(file_content)
+                log_info(f"[{ai_name}] 已创建临时文件: {tmp_file}（{len(file_content)}字）")
+
+                # 上传文件到AI页面
+                try:
+                    await self._upload_file(page, tmp_file, ai_name)
+                    log_info(f"[{ai_name}] 文件上传成功，等待页面处理...")
+                    await page.wait_for_timeout(2000)
+                    file_just_uploaded = True
+                except Exception as e:
+                    log_warning(f"[{ai_name}] 文件上传失败: {e}，回退到文字发送")
+                    tmp_file = None
+
+                # 设置上传后发送的文字消息
+                if tmp_file:
+                    message = text_after_upload
+
+            # 外部刚上传过文件（如 _init_one_ai 中的开场白阶段）：
+            # contenteditable 框架（千问 Slate.js 等）文件上传后内部状态不一致，
+            # execCommand 虽能视觉插入文字但不触发框架状态更新，发送按钮保持灰色。
+            # 复用 file_just_uploaded 路径，用 keyboard.type() 生成真实键盘事件。
+            if file_recently_uploaded and not file_just_uploaded:
+                file_just_uploaded = True
+                log_info(f"[{ai_name}] 检测到外部刚上传文件，使用 keyboard.type 输入消息（避免框架状态不同步）")
+
+            log_info(f"[{ai_name}] 定位输入框: {input_selector}")
+            input_el = await self._try_locate(page, input_selector, state="visible", timeout=10000)
+            if input_el is None:
+                raise Exception("输入框未找到，网页可能已更新或未登录。")
+
+            fill_ok = False
+            for attempt in range(3):
+                try:
+                    await input_el.click()
+                    await page.wait_for_timeout(300)
+
+                    if file_just_uploaded:
+                        # 文件上传后，Slate.js/ProseMirror 等框架的内部状态可能不一致
+                        # JS paste 事件或 textContent 虽能视觉上插入文字，但不触发框架状态更新
+                        # 导致发送按钮保持 disabled 状态
+                        # 直接用 keyboard.type() 生成真实键盘事件，所有框架都能识别
+                        log_info(f"[{ai_name}] 文件已上传，使用 keyboard.type 输入消息（真实键盘事件）")
+                        # 先清空输入框（Ctrl+A + Delete）
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.press("Delete")
+                        await page.wait_for_timeout(200)
+                        # 三段式混合输入：前5字慢输入 + 中间粘贴 + 后5字慢输入（比纯打字快 50 倍）
+                        await input_el.click()
+                        await page.wait_for_timeout(200)
+                        hybrid_ok = await self._type_message(page, message, delay=2, ai_name=ai_name)
+                        if not hybrid_ok:
+                            # execCommand 失败，回退到纯键盘输入（delay=1，快速）
+                            log_warning(f"[{ai_name}] 混合输入失败，回退到纯键盘输入（delay=1ms）")
+                            await input_el.click()
+                            await page.wait_for_timeout(200)
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Delete")
+                            await page.wait_for_timeout(100)
+                            lines = message.split('\n')
+                            for i, line in enumerate(lines):
+                                if i > 0:
+                                    await page.keyboard.press("Shift+Enter")
+                                    await page.wait_for_timeout(20)
+                                if line:
+                                    await page.keyboard.type(line, delay=1)
+                        await page.wait_for_timeout(800)
+                        # 验证发送按钮是否已激活
+                        btn_active = await page.evaluate("""() => {
+                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"], div.send-btn-wrapper button[type="submit"]');
+                            if (btn) {
+                                if (btn.disabled) return false;
+                                if (btn.className && btn.className.includes('empty')) return false;
+                                if (btn.getAttribute('aria-disabled') === 'true') return false;
+                                return true;
+                            }
+                            const ce = document.querySelector('[contenteditable="true"]');
+                            if (ce && ce.textContent && ce.textContent.trim().length > 0) return true;
+                            const ta = document.querySelector('textarea');
+                            if (ta && ta.value && ta.value.trim().length > 0) return true;
+                            return false;
+                        }""")
+                        if not btn_active:
+                            # keyboard.type 后按钮仍灰色，尝试 JS paste 事件作为后备
+                            log_warning(f"[{ai_name}] keyboard.type 后发送按钮仍为disabled，尝试 JS paste 事件补偿")
+                            await input_el.click()
+                            await page.wait_for_timeout(200)
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Delete")
+                            await page.wait_for_timeout(100)
+                            paste_ok = await page.evaluate("""(msg) => {
+                                const el = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+                                if (!el) return false;
+                                el.focus();
+                                try {
+                                    const dt = new DataTransfer();
+                                    dt.setData('text/plain', msg);
+                                    const pasteEvent = new ClipboardEvent('paste', {
+                                        bubbles: true, cancelable: true, clipboardData: dt
+                                    });
+                                    el.dispatchEvent(pasteEvent);
+                                    return true;
+                                } catch(e) {}
+                                try {
+                                    const inserted = document.execCommand('insertText', false, msg);
+                                    if (inserted) return true;
+                                } catch(e) {}
+                                return false;
+                            }""", message)
+                            if paste_ok:
+                                await page.wait_for_timeout(500)
+                            else:
+                                # 最终回退：纯键盘输入（delay=1，快速）
+                                log_warning(f"[{ai_name}] JS paste 也失败，纯键盘输入（delay=1ms）")
+                                await input_el.click()
+                                await page.wait_for_timeout(200)
+                                await page.keyboard.press("Control+A")
+                                await page.keyboard.press("Delete")
+                                await page.wait_for_timeout(100)
+                                lines = message.split('\n')
+                                for i, line in enumerate(lines):
+                                    if i > 0:
+                                        await page.keyboard.press("Shift+Enter")
+                                        await page.wait_for_timeout(20)
+                                    if line:
+                                        await page.keyboard.type(line, delay=1)
+                                await page.wait_for_timeout(500)
+                        # 最终检查：如果按钮仍灰色，不再清空输入框
+                        # 保留文字内容，继续尝试发送（_click_send_button 有多种发送策略）
+                        final_check = await page.evaluate("""() => {
+                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"], div.send-btn-wrapper button[type="submit"]');
+                            if (btn) {
+                                if (btn.disabled) return false;
+                                if (btn.className && btn.className.includes('empty')) return false;
+                                if (btn.getAttribute('aria-disabled') === 'true') return false;
+                            }
+                            return true;
+                        }""")
+                        if not final_check:
+                            log_warning(f"[{ai_name}] 发送按钮仍为disabled，保留输入内容继续尝试发送")
+                        log_info(f"[{ai_name}] 文件上传后消息处理完成（长度 {len(message)}）")
+                    else:
+                        # 方法1：用 execCommand 模拟真实文本插入（Vue/React都能识别）
+                        fill_success = await page.evaluate("""(msg) => {
+                        const el = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+                        if (!el) return false;
+                        el.focus();
+                        // 先清空
+                        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+                            el.value = '';
+                            el.select();
+                        } else {
+                            // contenteditable 元素：清空 Slate.js/ProseMirror 内部状态
+                            el.textContent = '';
+                            const range = document.createRange();
+                            range.selectNodeContents(el);
+                            const sel = window.getSelection();
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                            // 尝试 selectAll + delete 清除 Slate.js 内部状态
+                            document.execCommand('selectAll', false, null);
+                            document.execCommand('delete', false, null);
+                        }
+                        // 用 execCommand 插入文本（触发完整的input事件链）
+                        const inserted = document.execCommand('insertText', false, msg);
+                        if (inserted) {
+                            return true;
+                        }
+                        // execCommand 失败，回退到 nativeInputValueSetter
+                        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLTextAreaElement.prototype, 'value'
+                            ).set;
+                            nativeInputValueSetter.call(el, msg);
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                        // contenteditable 回退：直接设置 textContent + 触发事件
+                        // 注意：Slate.js 等框架可能不识别此方式，后续会用 keyboard.type 补偿
+                        el.textContent = msg;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        return true;
+                    }""", message)
+                        await page.wait_for_timeout(300)
+                        if not fill_success:
+                            # 回退到 fill
+                            await input_el.fill(message)
+                            await page.wait_for_timeout(200)
+                        # 等待 React 同步：填充后休息一段时间，让前端框架有时间处理状态
+                        await page.wait_for_timeout(600)
+                        # 验证Vue/React是否同步了状态：检查发送按钮是否不再是"empty"/"disabled"状态
+                        state_ok = await page.evaluate("""() => {
+                            // 注意：button:has-text() 是 Playwright 专有选择器，不能用在 document.querySelector 中
+                            // 只使用标准 CSS 选择器
+                            const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], div.send-btn-wrapper button[type="submit"]');
+                            if (btn) {
+                                if (btn.disabled) return false;  // 按钮仍为 disabled，框架未同步
+                                if (btn.className && btn.className.includes('empty')) return false;
+                                if (btn.getAttribute('aria-disabled') === 'true') return false;
+                            }
+                            const ta = document.querySelector('textarea');
+                            if (ta && ta.value && ta.value.length > 5) return true;
+                            // 检查 contenteditable 是否有实际内容
+                            const ce = document.querySelector('[contenteditable="true"]');
+                            if (ce && ce.textContent && ce.textContent.trim().length > 5) return true;
+                            return true;  // 无法判断，假设成功
+                        }""")
+                        if not state_ok:
+                            log_warning(f"[{ai_name}] 填充后发送按钮仍为disabled状态，尝试用 keyboard.type 真实键盘输入")
+                            # 对 contenteditable 元素（如千问的 Slate.js），execCommand 无法触发框架状态更新
+                            # 用 keyboard.type() 生成真实键盘事件，所有框架都能识别
+                            await input_el.click()
+                            await page.wait_for_timeout(200)
+                            # 先清空（Ctrl+A + Delete）
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Delete")
+                            await page.wait_for_timeout(200)
+                            # 三段式混合输入：前5字慢输入 + 中间粘贴 + 后5字慢输入（比纯打字快 50 倍）
+                            await input_el.click()
+                            await page.wait_for_timeout(200)
+                            hybrid_ok = await self._type_message(page, message, delay=2, ai_name=ai_name)
+                            if not hybrid_ok:
+                                # execCommand 失败，回退到纯键盘输入（delay=1，快速）
+                                log_warning(f"[{ai_name}] 混合输入失败，回退到纯键盘输入（delay=1ms）")
+                                await input_el.click()
+                                await page.wait_for_timeout(200)
+                                await page.keyboard.press("Control+A")
+                                await page.keyboard.press("Delete")
+                                await page.wait_for_timeout(100)
+                                lines = message.split('\n')
+                                for i, line in enumerate(lines):
+                                    if i > 0:
+                                        await page.keyboard.press("Shift+Enter")
+                                        await page.wait_for_timeout(20)
+                                    if line:
+                                        await page.keyboard.type(line, delay=1)
+                            await page.wait_for_timeout(800)
+                            # 验证发送按钮是否已激活
+                            btn_active = await page.evaluate("""() => {
+                                const btn = document.querySelector('button[aria-label*="发送"], .enter-icon-container, div[class*="send"], [data-testid="send-button"], button[class*="send"], div.send-btn-wrapper button[type="submit"]');
+                                if (btn) {
+                                    if (btn.disabled) return false;
+                                    if (btn.className && btn.className.includes('empty')) return false;
+                                    if (btn.getAttribute('aria-disabled') === 'true') return false;
+                                    return true;
+                                }
+                                const ce = document.querySelector('[contenteditable="true"]');
+                                if (ce && ce.textContent && ce.textContent.trim().length > 0) return true;
+                                return false;
+                            }""")
+                            if not btn_active:
+                                # keyboard.type 后按钮仍灰色，尝试 JS paste 事件作为后备
+                                log_warning(f"[{ai_name}] keyboard.type 后发送按钮仍为disabled，尝试 JS paste 事件补偿")
+                                await input_el.click()
+                                await page.wait_for_timeout(200)
+                                await page.keyboard.press("Control+A")
+                                await page.keyboard.press("Delete")
+                                await page.wait_for_timeout(100)
+                                paste_ok = await page.evaluate("""(msg) => {
+                                    const el = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+                                    if (!el) return false;
+                                    el.focus();
+                                    try {
+                                        const dt = new DataTransfer();
+                                        dt.setData('text/plain', msg);
+                                        const pasteEvent = new ClipboardEvent('paste', {
+                                            bubbles: true, cancelable: true, clipboardData: dt
+                                        });
+                                        el.dispatchEvent(pasteEvent);
+                                        return true;
+                                    } catch(e) {}
+                                    try {
+                                        const inserted = document.execCommand('insertText', false, msg);
+                                        if (inserted) return true;
+                                    } catch(e) {}
+                                    return false;
+                                }""", message)
+                                if paste_ok:
+                                    await page.wait_for_timeout(500)
+                                else:
+                                    # 最终回退：纯键盘输入（delay=1，快速）
+                                    log_warning(f"[{ai_name}] JS paste 也失败，纯键盘输入（delay=1ms）")
+                                    await input_el.click()
+                                    await page.wait_for_timeout(200)
+                                    await page.keyboard.press("Control+A")
+                                    await page.keyboard.press("Delete")
+                                    await page.wait_for_timeout(100)
+                                    lines = message.split('\n')
+                                    for i, line in enumerate(lines):
+                                        if i > 0:
+                                            await page.keyboard.press("Shift+Enter")
+                                            await page.wait_for_timeout(20)
+                                        if line:
+                                            await page.keyboard.type(line, delay=1)
+                                    await page.wait_for_timeout(500)
+                            log_info(f"[{ai_name}] 真实键盘输入完成（长度 {len(message)}）")
+                        log_info(f"[{ai_name}] 消息已填充（长度 {len(message)}），开始发送...")
+                    fill_ok = True
+                    break
+                except Exception as e:
+                    log_warning(f"[{ai_name}] 填充消息失败(尝试{attempt+1}/3): {e}")
+                    # 元素可能已失效，重新定位
+                    await page.wait_for_timeout(1000)
+                    input_el = await self._try_locate(page, input_selector, state="visible", timeout=5000)
+                    if input_el is None:
+                        # 尝试其他选择器
+                        for sel in ["textarea", '[contenteditable="true"]', '.ProseMirror', '[role="textbox"]']:
+                            input_el = await self._try_locate(page, sel, state="visible", timeout=2000)
+                            if input_el is not None:
+                                break
+                    if input_el is None:
+                        raise Exception("输入框重定位失败，网页可能已更新或未登录。")
+
+            if not fill_ok:
+                raise Exception("消息填充失败，输入框可能已失效。")
+
+            # 2. 激活输入框（触发 input 事件，让发送按钮变为可用）
+            await self._activate_input(page, input_el, ai_name)
+
+            # 3. 点击发送按钮（多种策略）
+            sent = await self._click_send_button(page, send_selector, input_el, ai_name, message, send_button_selectors)
+            if not sent:
+                log_error(f"[{ai_name}] 所有发送策略均失败")
+                raise Exception("无法找到发送按钮，请检查网页是否已更新。")
+
+            log_info(f"[{ai_name}] 消息已发送，等待回复...")
+
+            # 标记消息已成功发送，后续提取失败不应触发重发
+            message_sent = True
+
+            # 记录对话状态（用于验证提取的回复）
+            import time as _time
+            self._last_sent_to[ai_name] = {
+                "message": message,
+                "timestamp": _time.time(),
+                "content_len_before": content_len_before,
+                "reply_count_before": reply_count_before,
+            }
+            msg_preview = message[:50].replace('\n', ' ') + ('...' if len(message) > 50 else '')
+            log_info(f"[{ai_name}] 对话状态已记录: 发送了({len(message)}字) '{msg_preview}'")
+
+            # 4. 等待回复完成（传入发送前的状态和发送的消息）
+            import time as _time_mod
+            overall_deadline = _time_mod.time() + (timeout_ms / 1000)  # 总超时截止时间
+            # 重新测量基线：文件上传和消息发送可能已经改变了页面内容
+            try:
+                content_len_after_send = await page.evaluate("""() => document.body.innerText.length""")
+                if content_len_after_send != content_len_before:
+                    log_info(f"[{ai_name}] 发送后内容长度变化: {content_len_before} → {content_len_after_send}，使用新基线")
+                    content_len_before = content_len_after_send
+            except Exception:
+                pass
+            await self._wait_for_reply_complete(page, stop_selector, timeout_ms, reply_count_before, content_len_before, message, fast_wait, copy_btn_count_before, ai_name)
+
+            # 5. 提取最新回复，带验证重试
+            # 重试次数和间隔根据剩余超时时间动态计算，不超过配置的 timeout_seconds
+            reply_text = ""
+            sent_state = self._last_sent_to.get(ai_name, {})
+            sent_msg_preview = (sent_state.get("message", "")[:80] or "").replace('\n', ' ')
+
+            max_retries = 10
+            # 初始化提示特征词，用于在JS提取阶段排除开场白容器
+            init_markers = [
+                "你正在参与一场多AI群聊协作",
+                "多AI群聊协作",
+                "请等待发起话题",
+                "明白了就回复",
+                "【规则】",
+                "本次军帐议事一共有谋士",
+                "需要你与其他AI展开深度推演",
+            ]
+            # Kimi 等平台的占位符文本，提取到这些说明不是AI回复
+            placeholder_markers = [
+                "问点难的，让我多想一步",
+                "K2.6 思考",
+                "K2.6 快速",
+                "K1.5 思考",
+                "K1.5 快速",
+                '输入 "/" 唤起插件和技能',
+                "高峰时段算力不足",
+                "升级会员畅用思考模型",
+                "算力不足",
+                # 通义千问侧边栏元素
+                "我的空间", "智能体", "对话分组", "新分组",
+                "最近对话", "Qwen9953", "新建聊天",
+                # 通义千问功能菜单项
+                "PPT创作", "AI生视频", "AI生图",
+                # 智谱清言文件管理UI
+                "全选", "取消", "删除", "已选", "下载", "重命名",
+                "全选已选",
+                # MiniMax分段回复UI标签
+                "继续生成", "查看更多", "加载更多",
+                # 豆包占位符/UI文本
+                "发消息...", "快速新", "下载电脑版",
+                "PPT 生成", "图像生成", "帮我写作",
+                "视频生成", "深入研究", "录音转写",
+                "音乐生成", "解题答疑", "AI 播客",
+                "数据分析", "更多",
+                # 各平台额度/限制提示（非AI回复，是系统警告）
+                "套餐额度达上限",
+                "额度已用完",
+                "额度不足",
+                "请求过于频繁",
+                "服务暂时不可用",
+                "请稍后重试",
+                "账户余额不足",
+                "超出使用限制",
+                "已达到今日使用上限",
+                "已达到使用上限",
+                "升级套餐",
+                "开通会员",
+                "积分不足",
+                "配额已用尽",
+            ]
+            # 智谱清言广告/推广内容特征
+            ad_markers = [
+                "GLM-", "旗舰模型上线",
+                "扫描二维码", "保存名片", "分享智能体",
+                "点击体验", "立即下载",
+            ]
+            _last_page_len = -1  # 上次重试时的页面内容长度（用于检测页面是否变化）
+            for retry in range(max_retries):
+                # 检查是否已超过总超时
+                remaining = overall_deadline - _time_mod.time()
+                if remaining <= 5:
+                    log_warning(f"[{ai_name}] 总超时已到（剩余 {remaining:.0f}s），停止重试")
+                    break
+                # 智能重试间隔：如果页面内容未变化（提取问题而非AI还在思考），缩短等待
+                try:
+                    current_page_len = await page.evaluate("() => document.body.innerText.length")
+                except Exception:
+                    current_page_len = 0
+                page_changed = (current_page_len != _last_page_len)
+                _last_page_len = current_page_len
+                if retry == 0:
+                    retry_interval = max(5, min(15, int(remaining / 5)))
+                elif page_changed:
+                    # 页面有变化，AI可能还在输出，正常等待
+                    retry_interval = max(5, min(15, int(remaining / 5)))
+                else:
+                    # 页面未变化，是提取逻辑问题，缩短等待避免浪费时间
+                    retry_interval = 3
+                    log_info(f"[{ai_name}] 页面内容未变化（{current_page_len}字），缩短重试间隔至{retry_interval}s")
+
+                reply_text = await self._extract_last_response(page, last_response_selector, timeout_ms, ai_name, reply_count_before, message, init_markers)
+                if not reply_text:
+                    log_warning(f"[{ai_name}] 提取为空，重试 {retry+1}/{max_retries}...（等待AI回复中，{retry_interval}s后重试，剩余{remaining:.0f}s）")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能是初始化提示（开场白/系统提示词）
+                init_indicators = [
+                    ("【规则】" in reply_text and "请等待发起话题" in reply_text),
+                    ("你正在参与一场多AI群聊协作" in reply_text and "【规则】" in reply_text),
+                    ("请等待发起话题" in reply_text and "明白了就回复" in reply_text),
+                    ("多AI群聊协作" in reply_text and "深度推演" in reply_text and reply_text.strip().startswith("你正在")),
+                ]
+                if any(init_indicators):
+                    log_warning(f"[{ai_name}] 提取到初始化提示而非AI回复，重试 {retry+1}/{max_retries}...（AI可能还在思考，{retry_interval}s后重试）")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能是占位符/UI提示文字（Kimi等平台的输入框提示、模型选择器文字）
+                if any(p in reply_text for p in placeholder_markers) and len(reply_text.strip()) < 50:
+                    log_warning(f"[{ai_name}] 提取到占位符/UI文字而非AI回复({reply_text[:30]})，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能是广告/推广内容（智谱清言页面底部广告）
+                if any(ad in reply_text for ad in ad_markers) and len(reply_text.strip()) < 100:
+                    log_warning(f"[{ai_name}] 提取到广告/推广内容而非AI回复({reply_text[:30]})，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能是侧边栏导航内容（通义千问侧边栏）
+                sidebar_lines = [l.strip() for l in reply_text.split('\n') if l.strip()]
+                sidebar_label_count = sum(1 for l in sidebar_lines if l in ["新建对话", "我的空间", "智能体", "对话分组", "新分组", "最近对话", "Qwen9953", "新建聊天", "历史记录", "设置", "帮助"])
+                if len(sidebar_lines) >= 3 and sidebar_label_count >= len(sidebar_lines) * 0.5:
+                    log_warning(f"[{ai_name}] 提取到侧边栏导航内容而非AI回复({reply_text[:30]})，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能是"回复N/M"等MiniMax分段UI标签
+                import re as _re
+                if _re.match(r'^回复\d+/\d+$', reply_text.strip()) or _re.match(r'^\d+/\d+$', reply_text.strip()):
+                    log_warning(f"[{ai_name}] 提取到分段UI标签({reply_text[:30]})，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能是文件附件标签（如"HuaShanLunJian_技术文档.txt 36KB"）
+                if _re.match(r'^[\w\u4e00-\u9fff\-_.]+\.(txt|md|csv|pdf|docx?|xlsx?|pptx?|zip|rar)\s*\n?\s*\d*(KB|MB|GB|B)?\s*$', reply_text.strip(), _re.IGNORECASE):
+                    log_warning(f"[{ai_name}] 提取到文件附件标签({reply_text[:30]})，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复太短（<20字）时很可能是提取到了页面片段而非完整AI回复
+                # 但对于包含已知标识（<ok> <End> <结案>）的短回复，应直接接受
+                _known_signals = ["<ok>", "<end>", "<结案>", "<ok/>"]
+                _is_known_signal = any(sig in reply_text.lower() for sig in _known_signals)
+                if len(reply_text.strip()) < 20 and not _is_known_signal:
+                    log_warning(f"[{ai_name}] 提取内容过短({len(reply_text)}字: {reply_text[:30]})，可能不是完整回复，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能是发送的消息本身
+                if reply_text.strip() == message.strip():
+                    log_warning(f"[{ai_name}] 提取到发送消息本身，重试 {retry+1}/{max_retries}...（AI可能还没开始回复）")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能与上一次回复完全相同（防止提取到旧回复）
+                last_reply = self._last_reply.get(ai_name, "")
+                if last_reply and reply_text.strip() == last_reply.strip():
+                    log_warning(f"[{ai_name}] 提取到与上一次完全相同的回复（{len(reply_text)}字），可能提取了旧回复，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能包含发送消息的大部分内容（工具发送的消息被提取了）
+                if len(message) > 50 and message.strip()[:80] in reply_text and reply_text.strip()[:80] in message:
+                    log_warning(f"[{ai_name}] 提取内容与发送消息高度重叠，重试 {retry+1}/{max_retries}...（AI可能还没开始回复）")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复不能太短（AI回复至少应该有几个字，"ok"除外）
+                if len(reply_text.strip()) < 2 and "ok" not in reply_text.lower():
+                    log_warning(f"[{ai_name}] 提取内容过短（{len(reply_text)}字），重试 {retry+1}/{max_retries}...（AI可能还在思考）")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：内容长度交叉检查
+                # 如果页面内容增长很多但提取的回复很短，可能提取了UI元素（如"录音纪要"）
+                try:
+                    current_content_len = await page.evaluate("() => document.body.innerText.length")
+                except Exception:
+                    current_content_len = 0
+                content_growth = current_content_len - content_len_before
+                if content_growth > 200 and len(reply_text.strip()) < 50 and "ok" not in reply_text.lower():
+                    log_warning(f"[{ai_name}] 提取内容过短（{len(reply_text)}字）但页面内容增长{content_growth}字，可能提取了UI元素，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：提取内容远小于内容增长（可能只提取了一个片段）
+                if content_growth > 500 and len(reply_text.strip()) < content_growth * 0.15 and "ok" not in reply_text.lower():
+                    log_warning(f"[{ai_name}] 提取内容({len(reply_text)}字)远小于内容增长({content_growth}字)，可能只提取了片段，重试 {retry+1}/{max_retries}...")
+                    await asyncio.sleep(retry_interval)
+                    continue
+                # 验证：回复可能被截断（以常见标点结尾则视为完整，否则可能还在输出）
+                # 只在前2次重试且页面仍在变化时检查，避免无限等待
+                if retry < 2 and len(reply_text) > 50 and page_changed:
+                    stripped_end = reply_text.rstrip()
+                    # 检查是否以常见结束标点结尾
+                    ends_properly = stripped_end.endswith(('.', '。', '!', '！', '?', '？', '"', '"', "'", "'", ')', '）', '```', '<End>', '<End>', '---', '***'))
+                    if not ends_properly:
+                        log_warning(f"[{ai_name}] 提取内容可能被截断（不以标点结尾），重试 {retry+1}/{max_retries}...（AI可能还在输出）")
+                        await asyncio.sleep(min(retry_interval, 10))
+                        continue
+                # 验证通过
+                log_info(f"[{ai_name}] ✅ 回复验证通过（{len(reply_text)}字）")
+                self._last_reply[ai_name] = reply_text  # 记录本次回复，用于下次去重
+                break
+            else:
+                log_warning(f"[{ai_name}] 重试{max_retries}次后仍无法提取有效回复，尝试通用提取")
+                # 最后尝试：通用DOM提取
+                try:
+                    generic = await self._extract_generic_response(page, ai_name)
+                    if generic and len(generic) > len(reply_text):
+                        reply_text = generic
+                        log_info(f"[{ai_name}] 通用提取成功（{len(reply_text)}字）")
+                except Exception:
+                    pass
+                log_warning(f"[{ai_name}] 使用当前内容: {reply_text[:50]}...")
+
+            # 6. 后处理：过滤残留的思考过程内容
+            reply_text = self._strip_thinking_content(reply_text, ai_name)
+
+            # 7. 最终检查：如果回复是额度/限制警告，返回错误（不当作正常回复）
+            quota_markers = [
+                "套餐额度达上限", "额度已用完", "额度不足",
+                "账户余额不足", "超出使用限制", "已达到今日使用上限",
+                "已达到使用上限", "积分不足", "配额已用尽",
+            ]
+            if any(m in reply_text for m in quota_markers) and len(reply_text.strip()) < 100:
+                log_warning(f"[{ai_name}] 检测到额度/限制警告，不当作正常回复: {reply_text[:50]}")
+                raise Exception(f"额度不足: {reply_text[:50]}")
+
+            log_info(f"[{ai_name}] 回复提取完成（长度 {len(reply_text)}）: {reply_text[:100]}...")
+            return reply_text
+
+        except TimeoutError:
+            # 超时时消息可能已发送，附加标记防止 _send_to 重发
+            raise Exception(f"发送消息失败（超时）: {ai_name} {'MESSAGE_ALREADY_SENT' if message_sent else ''}")
+        except Exception as e:
+            log_exception(f"[{ai_name}] 发送消息失败", type(e), e, e.__traceback__)
+            # 消息已发送但后续步骤失败时，附加标记防止 _send_to 在旧页面上重发
+            # 这修复了开场白被重复发送 N 次的 bug
+            sent_flag = "MESSAGE_ALREADY_SENT" if message_sent else ""
+            raise Exception(f"发送消息失败: {e} {sent_flag}")
+
+    async def _upload_file(self, page: Page, file_path: str, ai_name: str):
+        """上传文件到 AI 平台。
+
+        统一使用模拟粘贴/拖放事件，不依赖各平台的上传按钮。
+        跟粘贴开场白一样的方式，绕过每个AI上传按钮不同的问题。
+        """
+        import os as _os
+        file_name = _os.path.basename(file_path)
+
+        try:
+            # 关闭已知弹窗
+            try:
+                await page.evaluate("""() => {
+                    const knownPopups = ['#maasGuidePopover', '[class*="guide-popover"]', '[class*="activity-modal"]'];
+                    knownPopups.forEach(sel => {
+                        document.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                }""")
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            # 模拟粘贴/拖放文件
+            log_info(f"[{ai_name}] 上传文件(粘贴/拖放): {file_path}")
+            await self._upload_via_paste_drop(page, file_path, file_name, ai_name)
+            await page.wait_for_timeout(2000)
+
+            # 验证
+            if await self._verify_file_uploaded(page, file_name, ai_name):
+                return
+
+            # 粘贴失败，回退到 input[type=file]（DeepSeek 等平台可用）
+            log_warning(f"[{ai_name}] 粘贴/拖放失败，回退到 input[type=file]")
+            file_inputs = await page.query_selector_all("input[type='file']")
+            if file_inputs:
+                import os as _os2
+                file_ext = "." + file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+                for idx, fi in enumerate(file_inputs):
+                    try:
+                        accept_attr = await fi.get_attribute("accept") or ""
+                        # 检查 accept 是否匹配文件扩展名
+                        if accept_attr and file_ext:
+                            accept_exts = [e.strip().lower() for e in accept_attr.split(",")]
+                            if file_ext not in accept_exts and "/*" not in " ".join(accept_exts):
+                                continue
+                        await fi.set_input_files(file_path)
+                        await page.wait_for_timeout(2000)
+                        if await self._verify_file_uploaded(page, file_name, ai_name):
+                            return
+                        else:
+                            try:
+                                await fi.set_input_files([])
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
+
+            log_warning(f"[{ai_name}] 文件上传失败")
+
+        except Exception as e:
+            log_warning(f"[{ai_name}] 文件上传失败: {e}")
+
+    async def _upload_via_paste_drop(self, page: Page, file_path: str,
+                                       file_name: str, ai_name: str) -> bool:
+        """模拟粘贴和拖放事件上传文件（绕过上传按钮）。
+
+        读取文件内容 → 创建 File 对象 → 触发 paste 和 drop 事件。
+        """
+        try:
+            with open(file_path, "rb") as f:
+                file_content = f.read()
+
+            import mimetypes
+            mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+
+            # 先聚焦输入框
+            input_selectors = ["textarea", '[contenteditable="true"]', ".ProseMirror", '[role="textbox"]']
+            for sel in input_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.click(timeout=2000)
+                        break
+                except Exception:
+                    continue
+
+            # 注入 JS：创建 File 对象，触发 paste 事件（成功则不再 drop）
+            result = await page.evaluate(
+                """([fileName, fileBytes, mimeType]) => {
+                // 创建 File 对象
+                const uint8 = new Uint8Array(fileBytes);
+                const file = new File([uint8], fileName, { type: mimeType });
+
+                // 找到输入框
+                const input = document.querySelector('textarea, [contenteditable="true"], .ProseMirror, [role="textbox"]')
+                    || document.activeElement;
+                if (!input) return 'no-input';
+
+                let pasteOk = false;
+                let dropOk = false;
+
+                // --- 尝试 paste 事件 ---
+                try {
+                    const dt = new DataTransfer();
+                    dt.items.add(file);
+
+                    const pasteEvent = new ClipboardEvent('paste', {
+                        bubbles: true,
+                        cancelable: true,
+                    });
+
+                    // 设置 clipboardData
+                    const cd = {
+                        files: [file],
+                        items: [{ kind: 'file', type: file.type, getAsFile: () => file }],
+                        getData: () => '',
+                        setData: () => {},
+                        types: ['Files'],
+                    };
+                    Object.defineProperty(pasteEvent, 'clipboardData', {
+                        value: cd, writable: false, configurable: true,
+                    });
+
+                    input.dispatchEvent(pasteEvent);
+                    pasteOk = true;
+                } catch (e) {
+                    // paste 失败，继续尝试 drop
+                }
+
+                // --- 只有 paste 失败时才尝试 drop（避免文件被粘贴两次） ---
+                if (!pasteOk) {
+                    try {
+                        const dt2 = new DataTransfer();
+                        dt2.items.add(file);
+                        dt2.setData('Files', '');
+
+                        const dragEnterEvent = new DragEvent('dragenter', {
+                            bubbles: true, cancelable: true, dataTransfer: dt2,
+                        });
+                        const dragOverEvent = new DragEvent('dragover', {
+                            bubbles: true, cancelable: true, dataTransfer: dt2,
+                        });
+                        const dropEvent = new DragEvent('drop', {
+                            bubbles: true, cancelable: true, dataTransfer: dt2,
+                        });
+
+                        input.dispatchEvent(dragEnterEvent);
+                        input.dispatchEvent(dragOverEvent);
+                        input.dispatchEvent(dropEvent);
+                        dropOk = true;
+                    } catch (e) {
+                        // drop 失败
+                    }
+                }
+
+                return 'paste=' + pasteOk + ',drop=' + dropOk;
+            }""",
+                [file_name, list(file_content), mime_type],
+            )
+
+            log_info(f"[{ai_name}] 粘贴/拖放事件结果: {result}")
+            return "true" in result
+        except Exception as e:
+            log_warning(f"[{ai_name}] 粘贴/拖放异常: {e}")
+            return False
+
+    async def _verify_file_uploaded(self, page: Page, file_name: str, ai_name: str) -> bool:
+        """验证文件是否真正上传成功：检查页面上是否出现文件名。"""
+        try:
+            await page.wait_for_timeout(1500)
+            page_text = await page.evaluate("() => document.body.innerText")
+            # 文件名去掉扩展名后检查（有些平台只显示文件名不含扩展名）
+            name_no_ext = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
+            if file_name in page_text or name_no_ext in page_text:
+                log_info(f"[{ai_name}] ✅ 文件上传验证成功: '{file_name}' 出现在页面上")
+                return True
+            else:
+                log_warning(f"[{ai_name}] ❌ 文件上传验证失败: '{file_name}' 未出现在页面上")
+                return False
+        except Exception as e:
+            log_warning(f"[{ai_name}] 文件验证异常: {e}")
+            return False
+
+    async def upload_file_to_pages(self, pages: dict, file_path: str):
+        """
+        将文件上传到所有 AI 页面（讨论开始前一次性调用）。
+
+        每个 AI 页面只上传一次，重复调用不会重复上传。
+
+        Args:
+            pages: {ai_name: Page} 字典
+            file_path: 本地文件绝对路径
+        """
+        if not file_path or not os.path.isfile(file_path):
+            return
+        if not hasattr(self, '_uploaded_pages'):
+            self._uploaded_pages = set()
+        for ai_name, page in pages.items():
+            if page in self._uploaded_pages:
+                continue
+            try:
+                log_info(f"[{ai_name}] 上传文件: {file_path}")
+                await self._upload_file(page, file_path, ai_name)
+                self._uploaded_pages.add(page)
+            except Exception as e:
+                log_warning(f"[{ai_name}] 文件上传失败: {e}")
+
+    async def _activate_input(self, page: Page, input_el, ai_name: str):
+        """
+        激活输入框，触发浏览器 input 事件，使发送按钮变为可用。
+
+        很多 AI 网页（如 DeepSeek）在输入框有用户输入前禁用发送按钮。
+        Playwright 的 fill() 不会触发所有浏览器原生事件，需要手动触发。
+        """
+        try:
+            log_info(f"[{ai_name}] 激活输入框（触发 input 事件）")
+
+            # 再次点击确保焦点
+            await input_el.click()
+            await page.wait_for_timeout(100)
+
+            # 通过 JS 触发原生 input 事件
+            # 使用 page.evaluate 直接操作 DOM
+            await page.evaluate("""(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return;
+                el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('compositionend', { bubbles: true }));
+            }""", 'textarea, [contenteditable="true"], [role="textbox"]')
+        except Exception as e:
+            log_warning(f"[{ai_name}] 激活输入框失败: {e}")
+
+    async def _type_message(self, page: Page, message: str, delay: int = 2,
+                            ai_name: str = "") -> bool:
+        """
+        纯逐字键盘输入消息（不使用粘贴，避免千问 Slate.js 等框架异常）。
+
+        策略：
+        1. 用 keyboard.type 逐个输入所有字符（触发框架状态更新）
+        2. 发送按钮激活
+
+        由于消息已在 send_and_wait 中被拆分为前20字+txt文件，
+        此处收到的消息通常不超过50字，逐字输入很快。
+
+        Args:
+            page: Playwright Page
+            message: 要输入的消息文本（通常为前20字+提示语）
+            delay: 打字时每个字符的延迟（毫秒），默认 2ms
+            ai_name: AI 名称（日志用）
+
+        Returns:
+            bool: True 表示输入成功
+        """
+        lines = message.split('\n')
+        for i, line in enumerate(lines):
+            if i > 0:
+                await page.keyboard.press("Shift+Enter")
+                await page.wait_for_timeout(30)
+            if line:
+                await page.keyboard.type(line, delay=delay)
+
+        log_info(f"[{ai_name}] 逐字键盘输入完成（{len(message)}字）")
+        return True
+
+    async def _click_send_button(self, page: Page, config_selector: str,
+                                  input_el, ai_name: str, message: str = "",
+                                  platform_selectors: list = None) -> bool:
+        """
+        发送消息 — 严格单次发送，绝不重复点击。
+
+        流程（由简到繁，每种方式只试一次）：
+        1. 等待 React 同步（填充后等 800ms 让前端框架处理状态）
+        2. 重新定位 textarea（React 可能重新渲染了旧引用）
+        3. 方式1: JS focus + Playwright keyboard Enter（最可靠，不依赖 DOM 结构）
+        4. 方式2: JS click 所有可能的发送按钮（综合所有平台的所有已知选择器）
+        5. 方式3: form.submit（兜底，找最近的 form 提交）
+        """
+        # === 等待 React 同步 ===
+        await page.wait_for_timeout(800)
+
+        # === 重新定位 textarea ===
+        fresh_textarea = None
+        try:
+            ta = await page.query_selector("textarea")
+            if ta:
+                fresh_textarea = ta
+        except Exception:
+            pass
+        if not fresh_textarea:
+            try:
+                ce = await page.query_selector('[contenteditable="true"]')
+                if ce:
+                    fresh_textarea = ce
+            except Exception:
+                pass
+        if fresh_textarea:
+            input_el = fresh_textarea
+
+        before_text = message
+        try:
+            val = await input_el.input_value()
+            before_text = val
+        except Exception:
+            pass
+
+        # === 确保焦点在 textarea 上（通过 JS 强制设置） ===
+        try:
+            await page.evaluate("""() => {
+                const el = document.querySelector('textarea') ||
+                           document.querySelector('[contenteditable="true"]') ||
+                           document.querySelector('[role="textbox"]');
+                if (el) { el.focus(); el.click(); }
+            }""")
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        # ============================================================
+        # 方式1: JS focus + Playwright keyboard Enter
+        #   Playwright 的 keyboard.press 发送操作系统级 key 事件，
+        #   在所有 React/Vue 页面上都是最可靠的发送方式。
+        # ============================================================
+        log_info(f"[{ai_name}] 尝试方式1: Playwright Enter 发送")
+        try:
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(2000)
+            if await self._verify_sent(page, input_el, before_text, ai_name, "Playwright Enter"):
+                return True
+            try:
+                remaining = await input_el.input_value()
+            except Exception:
+                remaining = ""
+            if not remaining or len(str(remaining).strip()) < 3:
+                log_info(f"[{ai_name}] 方式1成功: 输入框已清空")
+                return True
+            log_info(f"[{ai_name}] 方式1未成功(输入框仍有 {len(str(remaining))} 字)")
+        except Exception as e:
+            log_warning(f"[{ai_name}] 方式1失败: {e}")
+
+        # ============================================================
+        # 方式2: JS 点击发送按钮
+        #   综合所有已知平台的发送按钮选择器，暴力尝试。
+        # ============================================================
+        log_info(f"[{ai_name}] 尝试方式2: JS 点击发送按钮")
+        send_selectors = []
+        # 平台专用选择器
+        if platform_selectors:
+            send_selectors.extend(platform_selectors)
+        if config_selector and config_selector not in send_selectors:
+            send_selectors.append(config_selector)
+        # 综合所有已知平台的发送按钮选择器（硬编码兜底，避免配置遗漏）
+        ALL_SEND_SELECTORS = [
+            # DeepSeek 格式
+            'div[class*="input"] div[role="button"]:last-child',
+            'div[class*="input"] button:last-child',
+            'div.enter.is-main-chat',
+            'div.enter-icon-container:not(.empty)',
+            'div[class*="enter-icon-container"]:not(.empty)',
+            'img.enter_icon',
+            # 智谱格式
+            'div[class*="send"]',
+            'button[class*="send"]',
+            'div[class*="chat-input-send"]',
+            'div[class*="submit"]',
+            'button[aria-label*="发送"]',
+            'div[aria-label*="发送"]',
+            'div.chat-input-footer div[class*="icon"]:not([class*="stop"])',
+            # 通义格式
+            'button:has-text("发送")',
+            # MiniMax 格式
+            'div[data-testid="send-button"]',
+            'button[data-testid="send-button"]',
+        ]
+        for sel in ALL_SEND_SELECTORS:
+            if sel not in send_selectors:
+                send_selectors.append(sel)
+
+        for sel in send_selectors:
+            if not sel:
+                continue
+            try:
+                btn = await page.query_selector(sel)
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    log_info(f"[{ai_name}] 点击发送按钮: {sel}")
+                    await page.wait_for_timeout(1500)
+                    if await self._verify_sent(page, input_el, before_text, ai_name, f"点击({sel})"):
+                        return True
+                    try:
+                        remaining = await input_el.input_value()
+                    except Exception:
+                        remaining = ""
+                    if not remaining or len(str(remaining).strip()) < 3:
+                        log_info(f"[{ai_name}] 方式2成功: 点击后输入框已清空")
+                        return True
+                    log_info(f"[{ai_name}] 按钮{sel}点击后未发送，尝试下一个")
+                    break  # 只点击一个可见按钮，防止误点停止按钮
+            except Exception:
+                continue
+
+        # ============================================================
+        # 方式3: 兜底 — form.submit / Meta+Enter / Shift+Enter
+        # ============================================================
+        log_info(f"[{ai_name}] 尝试方式3: 兜底提交")
+        try:
+            submitted = await page.evaluate("""() => {
+                const ta = document.querySelector('textarea') || document.querySelector('[contenteditable="true"]');
+                if (ta) {
+                    const form = ta.closest('form');
+                    if (form) { form.requestSubmit(); return true; }
+                }
+                // Ctrl/Meta + Enter
+                const active = document.activeElement;
+                if (active) {
+                    ['keydown', 'keypress'].forEach(type => {
+                        active.dispatchEvent(new KeyboardEvent(type, {
+                            key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                            bubbles: true, cancelable: true,
+                            metaKey: true, ctrlKey: true
+                        }));
+                    });
+                    return true;
+                }
+                return false;
+            }""")
+            if submitted:
+                await page.wait_for_timeout(2000)
+                if await self._verify_sent(page, input_el, before_text, ai_name, "兜底"):
+                    return True
+        except Exception as e:
+            log_warning(f"[{ai_name}] 方式3失败: {e}")
+
+        return False
+
+    async def _verify_sent(self, page: Page, input_el, before_text: str,
+                            ai_name: str, method: str) -> bool:
+        """
+        验证消息是否成功发送。
+
+        判断依据（按可靠性排序）：
+        1. 页面 body 内容显著增长 → 有新回复，肯定已发送
+        2. input_el 已脱离 DOM → 发送后重新渲染输入框
+        3. 输入框已清空或内容变化 → 已发送
+        4. 搜索弹窗出现 → 误触，返回 False
+
+        轮询检测：每500ms检查一次，最多6次（3秒），
+        解决React异步渲染导致DOM延迟更新的问题。
+        """
+        # 检查是否弹出了搜索对话框
+        try:
+            search_dialog = await page.query_selector(
+                "[class*='search'] [class*='dialog'], [class*='search-popup'], "
+                "[class*='search-modal']"
+            )
+            if search_dialog and await search_dialog.is_visible():
+                log_warning(f"[{ai_name}] 检测到搜索弹窗，尝试关闭")
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+                return False
+        except Exception:
+            pass
+
+        # 记录发送前的页面内容长度
+        try:
+            before_body_len = await page.evaluate("() => document.body.innerText.length")
+        except Exception:
+            before_body_len = 0
+
+        # 轮询检测：每500ms检查一次，最多8次（4秒）
+        for check_idx in range(8):
+            await page.wait_for_timeout(500)
+
+            # 判断0（高优先级）：页面 body 内容是否有显著增长（最可靠，不受 DOM 结构影响）
+            try:
+                after_body_len = await page.evaluate("() => document.body.innerText.length")
+            except Exception:
+                after_body_len = before_body_len
+
+            if after_body_len > before_body_len + 80:
+                log_info(f"[{ai_name}] 发送成功（{method}），页面内容增长 {before_body_len}→{after_body_len} [轮询第{check_idx+1}次]")
+                return True
+
+            # 判断1：input_el 是否已脱离 DOM（发送后重新渲染输入框）
+            input_detached = False
+            try:
+                await input_el.input_value()
+            except Exception:
+                input_detached = True
+
+            if input_detached:
+                log_info(f"[{ai_name}] 发送成功（{method}），输入框已重新渲染（DOM detach）[轮询第{check_idx+1}次]")
+                return True
+
+            # 判断2：输入框是否已清空（用 JS 直接读取，避免 Playwright 元素引用过期）
+            try:
+                after_text = await page.evaluate("""() => {
+                    const el = document.querySelector('textarea') ||
+                               document.querySelector('[contenteditable="true"]') ||
+                               document.querySelector('[role="textbox"]');
+                    if (!el) return '';
+                    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') return el.value;
+                    return el.textContent || '';
+                }""")
+            except Exception:
+                after_text = ""
+
+            if not after_text or len(after_text.strip()) < 3 or after_text != before_text:
+                log_info(f"[{ai_name}] 发送成功（{method}），输入框已清空/变化 [轮询第{check_idx+1}次]")
+                return True
+
+        log_warning(f"[{ai_name}] {method} 后无变化(输入框={len(after_text)}字, 页面={after_body_len})")
+        return False
+
+    def _is_sent_message_content(self, content: str, sent_message: str = "") -> bool:
+        """检查复制按钮关联的内容是否属于"发送的消息"（而非AI回复）。
+
+        核心策略（用户方案）：直接与发送的消息文本对比。
+        1. 计算网页上实际显示的文本（处理20字截断+文件引用）
+        2. 归一化后比较前30字指纹
+        3. 模式匹配作为辅助兜底
+
+        原理：发送消息后，用户消息会产生复制按钮。
+        如果最后一个复制按钮的内容 = 发送的消息 → AI还没回复
+        如果最后一个复制按钮的内容 ≠ 发送的消息 → AI已回复
+        """
+        if not content:
+            # 内容为空，无法判断，返回 False 表示"不是发送消息"
+            # 调用方应检查 last_content 是否为空，为空时不做判断
+            return False
+
+        # ---- 核心策略：直接对比发送的消息文本 ----
+        if sent_message:
+            # sent_message 已经是实际输入到浏览器的文本（即网页上显示的文本）
+            # send_and_wait 中：文件上传成功后 message 会被重赋值为 text_after_upload
+            # （前20字 + "[后续内容请见上传的文件]"），文件上传失败则发送完整原文
+            # 所以无需再次截断，直接用 sent_message 作为 displayed_text
+            displayed_text = sent_message
+
+            # 归一化：去除所有空白和换行，只比较实际文字内容
+            def _normalize(s: str) -> str:
+                return re.sub(r'\s+', '', s).strip()
+
+            content_norm = _normalize(content[:300])  # 取前300字足够比较
+            displayed_norm = _normalize(displayed_text[:300])
+
+            if displayed_norm:
+                # 取前30字作为指纹（比原来15字更可靠）
+                fingerprint = displayed_norm[:30]
+                if fingerprint and content_norm.startswith(fingerprint):
+                    return True
+                # 反向检查：发送消息是否以内容开头（内容可能被网页截断）
+                content_fp = content_norm[:30]
+                if content_fp and len(content_fp) >= 10 and displayed_norm.startswith(content_fp):
+                    return True
+
+        # ---- 辅助：模式匹配（处理特殊情况） ----
+        head = content[:100]
+        # 轮次发言标记 【第X轮 - 军师/谋士发言】
+        if re.search(r'【第\d+轮\s*-\s*(军师|谋士)发言】', head):
+            return True
+        # 规则标记
+        if '【规则】' in head[:50]:
+            return True
+        # 主公消息
+        if head.startswith('主公：') or head.startswith('主公:') or head.startswith('主公补充：'):
+            return True
+        # 系统通知
+        if head.startswith('【系统通知】'):
+            return True
+        # 讨论话题/回复标记
+        if head.startswith('【讨论话题】') or head.startswith('【讨论回复】'):
+            return True
+
+        return False
+
+    async def _wait_for_reply_complete(self, page: Page, stop_selector: str,
+                                       timeout_ms: int, reply_count_before: int = -1,
+                                       content_len_before: int = 0,
+                                       sent_message: str = "",
+                                       fast_wait: bool = False,
+                                       copy_btn_count_before: int = 0,
+                                       ai_name: str = ""):
+        """
+        等待 AI 回复完成。
+
+        优先策略：复制按钮计数检测（AI回复完成后会新增复制按钮，比内容稳定检测快很多）。
+        回退策略：内容增长 + 稳定检测（连续N秒无变化）。
+
+        流程：
+        1. 强制最小等待（确保AI有时间开始回复）
+        2. 优先用复制按钮检测：每1秒扫描，复制按钮数量增加 → 回复完成
+        3. 回退到内容增长检测：等待内容开始增长
+        4. 回退到内容稳定检测：持续监测直到连续N秒无变化
+
+        fast_wait=True 时使用更短的等待时间（用于简短确认回复如"ok"）。
+        """
+        import time
+
+        deadline = time.time() + (timeout_ms / 1000)
+        sent_len = len(sent_message)
+
+        # 统计复制按钮数量 + 最后一个复制按钮内容头部的JS函数
+        # 用于内容感知检测：区分"发送消息的复制按钮"和"AI回复的复制按钮"
+        COUNT_COPY_BTN_WITH_CONTENT_JS = """() => {
+            const found = [];
+            // 策略1: aria-label 含"复制"/"copy"
+            document.querySelectorAll('[aria-label]').forEach(el => {
+                const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                if (label === '复制' || label === 'copy' || label.includes('复制') || label.includes('copy')) {
+                    if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                        found.push(el);
+                    }
+                }
+            });
+            // 策略2: 文字"复制"的按钮
+            document.querySelectorAll('button, [role="button"], [class*="icon-button"], [class*="action"]').forEach(el => {
+                const text = (el.textContent || '').trim();
+                if (text === '复制' || text === 'Copy') {
+                    found.push(el);
+                }
+            });
+            // 策略3: class 含"copy"
+            document.querySelectorAll('[class*="copy" i]').forEach(el => {
+                if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                    found.push(el);
+                }
+            });
+            // 策略3b: data-icon-type 含"copy"（千问等平台用 data-icon-type="qwpcicon-copy"）
+            document.querySelectorAll('[data-icon-type*="copy" i]').forEach(el => {
+                const btn = el.closest('button, [role="button"], [data-state="closed"]') || el;
+                found.push(btn);
+            });
+            // 策略4: 回复区块底部工具栏的第一个按钮
+            const footerSelectors = [
+                '.ds-markdown--footer',
+                '[class*="message-action-bar"]',
+                '[class*="message-footer"]',
+                '[class*="answer-footer"]',
+                '[class*="segment-assistant-actions"]',
+                '[class*="chat-action"]',
+                '[class*="msg-action"]',
+                '[class*="reply-action"]',
+                '[class*="footer-action"]',
+                '[data-answer-feedback-toolbar]',  // 千问：data-answer-feedback-toolbar="true"
+            ];
+            footerSelectors.forEach(sel => {
+                try {
+                    document.querySelectorAll(sel).forEach(bar => {
+                        // 扩展搜索范围：button + role=button + data-state=closed 的div（千问复制按钮是div）
+                        const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"], div[data-state="closed"]');
+                        if (btns.length > 0) {
+                            for (const btn of btns) {
+                                const aria = (btn.getAttribute('aria-label') || '').trim();
+                                const text = (btn.textContent || '').trim();
+                                if (aria !== '朗读' && aria !== 'Read aloud' && text !== '朗读') {
+                                    found.push(btn);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                } catch(e) {}
+            });
+            // 去重并按DOM顺序排序
+            const unique = [];
+            const seen = new Set();
+            found.forEach(el => {
+                if (!seen.has(el)) { seen.add(el); unique.push(el); }
+            });
+            unique.sort((a, b) => {
+                if (a === b) return 0;
+                const pos = a.compareDocumentPosition(b);
+                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                return 0;
+            });
+            // 获取最后一个复制按钮关联的消息内容头部
+            // 改进：优先在复制按钮附近查找AI回复内容容器，避免获取到用户消息内容
+            let lastContent = '';
+            if (unique.length > 0) {
+                const lastBtn = unique[unique.length - 1];
+                // 策略A: 优先查找复制按钮所在消息块内的AI回复内容容器
+                // 这些选择器匹配各平台的AI回复内容区域（不含用户消息）
+                const replySelectors = [
+                    '.ds-markdown--content',
+                    'div[class*="markdown-body"]',
+                    'div[class*="message-content"]',
+                    'div[class*="answer-content"]',
+                    'div[class*="reply-content"]',
+                    'div[class*="bubble-content"]',
+                    'div[class*="markdown"]:not([class*="think"])',
+                    'div[class*="bubble"]:not([class*="think"])',
+                    'div[data-role="assistant"]',
+                    'div[class*="prose"]',
+                    '.qk-markdown',  // 千问：qk-markdown qk-markdown-react
+                ];
+                let el = lastBtn;
+                for (let i = 0; i < 15; i++) {
+                    if (!el) break;
+                    // 在当前层级查找AI回复内容容器
+                    for (const sel of replySelectors) {
+                        try {
+                            const replyEl = el.querySelector(sel);
+                            if (replyEl) {
+                                const text = replyEl.innerText || '';
+                                if (text.length > 10) {
+                                    lastContent = text.substring(0, 150);
+                                    break;
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    if (lastContent) break;
+                    el = el.parentElement;
+                }
+                // 策略B: 回退到原来的逻辑（向上遍历找第一个有文字的父级）
+                if (!lastContent) {
+                    el = lastBtn;
+                    for (let i = 0; i < 15; i++) {
+                        el = el.parentElement;
+                        if (!el) break;
+                        const text = el.innerText || '';
+                        if (text.length > 10) {
+                            lastContent = text.substring(0, 150);
+                            break;
+                        }
+                    }
+                }
+            }
+            return { count: unique.length, last_content: lastContent };
+        }"""
+
+        # 步骤1: 强制等待（fast_wait 模式 0.3 秒，正常 0.5 秒）
+        min_wait = 0.3 if fast_wait else 0.5
+        log_info(f"强制等待 {min_wait} 秒...")
+        await asyncio.sleep(min_wait)
+
+        # 步骤2: 优先用复制按钮+内容感知检测（每0.5秒扫描一次）
+        # 核心优化：不仅检查复制按钮数量增加，还检查最后一个复制按钮的内容
+        # 如果内容是"发送的消息"（如【第X轮 - 谋士发言】），说明是工具消息的复制按钮，继续等待
+        # 只有当最后一个复制按钮的内容不属于发送消息时，才判定AI回复完成
+        if copy_btn_count_before > 0 or not fast_wait:
+            log_info(f"[{ai_name}] 优先策略：复制按钮+内容感知检测（基线={copy_btn_count_before}）...")
+            btn_check_start = time.time()
+            btn_check_interval = 0.5 if not fast_wait else 0.3  # 加快检测频率
+            # 最长检测 30% 的超时时间（从60%降低，避免空转太久）
+            btn_deadline = min(deadline, time.time() + (timeout_ms / 1000) * 0.3)
+            sent_msg_misjudge_count = 0  # 连续误判为发送消息的计数
+            sent_msg_misjudge_limit = 5  # 连续5次误判（约2.5秒）则退出到步骤4
+            while time.time() < btn_deadline:
+                try:
+                    result = await asyncio.wait_for(
+                        page.evaluate(COUNT_COPY_BTN_WITH_CONTENT_JS),
+                        timeout=5
+                    )
+                    current_copy_btns = result.get("count", 0)
+                    last_content = result.get("last_content", "")
+                except asyncio.TimeoutError:
+                    log_warning(f"[{ai_name}] 复制按钮检测超时(5s)，回退到内容检测")
+                    break
+                except Exception as e:
+                    log_warning(f"[{ai_name}] 复制按钮检测异常: {e}，回退到内容检测")
+                    break
+
+                if current_copy_btns > copy_btn_count_before:
+                    # 复制按钮增加，检查最后一个是否属于AI回复（而非发送的消息）
+                    if not last_content:
+                        # 内容为空，无法判断是发送消息还是AI回复，继续等待
+                        # 不重置也不增加误判计数，等下一轮再检测
+                        log_info(f"[{ai_name}] 复制按钮增加({copy_btn_count_before}→{current_copy_btns})但内容为空，继续等待")
+                    elif self._is_sent_message_content(last_content, sent_message):
+                        # 最后一个复制按钮属于发送的消息，AI还未回复，继续等待
+                        sent_msg_misjudge_count += 1
+                        log_info(f"[{ai_name}] 复制按钮增加({copy_btn_count_before}→{current_copy_btns})但内容为发送消息({sent_msg_misjudge_count}/{sent_msg_misjudge_limit})")
+                        # 连续多次误判，说明内容获取逻辑可能有问题，退出到步骤4
+                        if sent_msg_misjudge_count >= sent_msg_misjudge_limit:
+                            log_info(f"[{ai_name}] 连续{sent_msg_misjudge_limit}次判断为发送消息，可能内容获取有误，回退到内容稳定检测")
+                            break
+                    else:
+                        # 最后一个复制按钮属于AI回复，检测完成！
+                        log_info(f"[{ai_name}] ✅ 复制按钮增加且内容为AI回复: {copy_btn_count_before} → {current_copy_btns}（耗时 {time.time()-btn_check_start:.1f}s）")
+                        if last_content:
+                            log_info(f"[{ai_name}] 最后复制按钮内容头部: {last_content[:60]}...")
+                        await asyncio.sleep(0.3)  # 缩短等待，DOM已渲染
+                        return
+                else:
+                    # 复制按钮未增加，重置误判计数
+                    sent_msg_misjudge_count = 0
+
+                await asyncio.sleep(btn_check_interval)
+
+            log_info(f"[{ai_name}] 复制按钮检测未触发（{time.time()-btn_check_start:.0f}s），回退到内容稳定检测")
+
+        # 步骤3: 回退策略 - 等待内容开始增长（AI开始输出，包括思考过程）
+        log_info(f"等待AI回复内容开始增长（基线: {content_len_before}, 发送消息: {sent_len}）...")
+        expected_min_len = content_len_before + max(sent_len * 0.3, 50) + 50
+        if sent_len > 5000:
+            expected_min_len = content_len_before + 200
+        wait_start = time.time()
+        growth_started = False
+        last_logged_len = 0
+        log_counter = 0
+        while time.time() < deadline:
+            try:
+                current_len = await asyncio.wait_for(
+                    page.evaluate("""() => document.body.innerText.length"""),
+                    timeout=10
+                )
+            except asyncio.TimeoutError:
+                log_warning(f"页面内容检测超时(10s)，跳过增长等待")
+                growth_started = True
+                break
+            except Exception as e:
+                log_warning(f"页面内容检测异常: {e}，跳过增长等待")
+                growth_started = True
+                break
+            if current_len > expected_min_len:
+                log_info(f"内容开始增长（{current_len} > {expected_min_len}，耗时 {time.time()-wait_start:.1f}s）")
+                growth_started = True
+                break
+            log_counter += 1
+            if log_counter % 10 == 0 and current_len != last_logged_len:
+                log_info(f"等待增长中... 当前={current_len}, 目标={expected_min_len}（已等待{time.time()-wait_start:.0f}s）")
+                last_logged_len = current_len
+            await asyncio.sleep(0.3 if fast_wait else 0.5)
+
+        if not growth_started:
+            log_warning(f"等待内容增长超时，继续执行")
+            return
+
+        # 步骤4: 回退策略 - 持续监测内容增长，直到连续N秒无变化
+        # 同时并行检测复制按钮+内容，如果复制按钮增加且内容为AI回复则提前完成
+        check_interval = 0.3 if fast_wait else 0.5  # 加快检测频率到0.5秒
+        stable_threshold = 2 if fast_wait else 2  # 降低到2秒，因为内容感知检测更可靠
+        log_info(f"监测内容增长，等待稳定（连续{stable_threshold}秒无变化，{check_interval}秒/次）...")
+        last_len = 0
+        stable_seconds = 0
+        monitor_start = time.time()
+        shrink_detected = False
+        shrink_extra = 0
+
+        while time.time() < deadline:
+            # 并行检测：内容长度 + 复制按钮数量 + 最后复制按钮内容
+            try:
+                result = await asyncio.wait_for(
+                    page.evaluate("""() => {
+                        const len = document.body.innerText.length;
+                        const found = [];
+                        document.querySelectorAll('[aria-label]').forEach(el => {
+                            const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                            if (label === '复制' || label === 'copy' || label.includes('复制') || label.includes('copy')) {
+                                if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') found.push(el);
+                            }
+                        });
+                        document.querySelectorAll('button, [role="button"], [class*="icon-button"], [class*="action"]').forEach(el => {
+                            const text = (el.textContent || '').trim();
+                            if (text === '复制' || text === 'Copy') found.push(el);
+                        });
+                        document.querySelectorAll('[class*="copy" i]').forEach(el => {
+                            if (el.querySelector('svg') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') found.push(el);
+                        });
+                        const fts = ['.ds-markdown--footer','[class*="message-action-bar"]','[class*="message-footer"]','[class*="answer-footer"]','[class*="segment-assistant-actions"]','[class*="chat-action"]','[class*="msg-action"]','[class*="reply-action"]','[class*="footer-action"]'];
+                        fts.forEach(sel => {
+                            try {
+                                document.querySelectorAll(sel).forEach(bar => {
+                                    const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"]');
+                                    if (btns.length > 0) {
+                                        for (const btn of btns) {
+                                            const aria = (btn.getAttribute('aria-label') || '').trim();
+                                            const text = (btn.textContent || '').trim();
+                                            if (aria !== '朗读' && aria !== 'Read aloud' && text !== '朗读') { found.push(btn); break; }
+                                        }
+                                    }
+                                });
+                            } catch(e) {}
+                        });
+                        const unique = [];
+                        const seen = new Set();
+                        found.forEach(el => { if (!seen.has(el)) { seen.add(el); unique.push(el); } });
+                        unique.sort((a, b) => {
+                            if (a === b) return 0;
+                            const pos = a.compareDocumentPosition(b);
+                            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                            return 0;
+                        });
+                        let lastContent = '';
+                        if (unique.length > 0) {
+                            const lastBtn = unique[unique.length - 1];
+                            // 策略A: 优先查找复制按钮附近的AI回复内容容器
+                            const replySels = ['.ds-markdown--content','div[class*="markdown-body"]','div[class*="message-content"]','div[class*="answer-content"]','div[class*="reply-content"]','div[class*="bubble-content"]','div[class*="markdown"]:not([class*="think"])','div[class*="bubble"]:not([class*="think"])','div[data-role="assistant"]','div[class*="prose"]'];
+                            let el = lastBtn;
+                            for (let i = 0; i < 15; i++) {
+                                if (!el) break;
+                                for (const sel of replySels) {
+                                    try {
+                                        const rEl = el.querySelector(sel);
+                                        if (rEl) { const t = rEl.innerText || ''; if (t.length > 10) { lastContent = t.substring(0, 150); break; } }
+                                    } catch(e) {}
+                                }
+                                if (lastContent) break;
+                                el = el.parentElement;
+                            }
+                            // 策略B: 回退到向上遍历
+                            if (!lastContent) {
+                                el = lastBtn;
+                                for (let i = 0; i < 15; i++) {
+                                    el = el.parentElement;
+                                    if (!el) break;
+                                    const text = el.innerText || '';
+                                    if (text.length > 10) { lastContent = text.substring(0, 150); break; }
+                                }
+                            }
+                        }
+                        return { len: len, count: unique.length, last_content: lastContent };
+                    }"""),
+                    timeout=10
+                )
+                current_len = result.get("len", 0)
+                current_copy_btns = result.get("count", 0)
+                last_content = result.get("last_content", "")
+            except asyncio.TimeoutError:
+                log_warning(f"页面内容监测超时(10s)，跳过稳定检测")
+                break
+            except Exception as e:
+                log_warning(f"页面内容监测异常: {e}，跳过稳定检测")
+                break
+
+            # 复制按钮+内容感知检测：如果增加且内容为AI回复，说明回复完成
+            if current_copy_btns > copy_btn_count_before:
+                if not last_content:
+                    # 内容为空，无法判断，继续内容稳定检测
+                    pass
+                elif self._is_sent_message_content(last_content, sent_message):
+                    # 最后一个复制按钮属于发送的消息，继续等待
+                    pass
+                else:
+                    log_info(f"[{ai_name}] ✅ 稳定检测中复制按钮增加且内容为AI回复: {copy_btn_count_before} → {current_copy_btns}，AI回复完成")
+                    await asyncio.sleep(0.3)
+                    return
+
+            if current_len == last_len:
+                stable_seconds += check_interval
+                effective_threshold = stable_threshold + shrink_extra
+                if stable_seconds >= effective_threshold:
+                    log_info(f"内容已稳定（长度 {current_len}，稳定 {stable_seconds}s，总监测 {time.time()-monitor_start:.1f}s，缩折叠={shrink_detected}）")
+                    break
+            elif current_len < last_len:
+                shrink_amount = last_len - current_len
+                if shrink_amount > 500:
+                    shrink_extra = max(shrink_extra, 6)
+                elif shrink_amount > 200:
+                    shrink_extra = max(shrink_extra, 4)
+                else:
+                    shrink_extra = max(shrink_extra, 2)
+                log_info(f"内容缩小: {last_len} → {current_len}（-{shrink_amount}），可能是思考过程折叠，额外等待{shrink_extra}s")
+                shrink_detected = True
+                stable_seconds = 0
+                last_len = current_len
+            else:
+                if last_len > 0:
+                    log_info(f"内容仍在增长: {last_len} → {current_len}（+{current_len-last_len}）")
+                stable_seconds = 0
+                last_len = current_len
+
+            await asyncio.sleep(check_interval)
+
+        # 最终等待确保渲染完成
+        final_wait = 0.3 if fast_wait else 0.5
+        await asyncio.sleep(final_wait)
+
+    async def _wait_content_stable(self, page: Page, deadline: float,
+                                   check_interval: int = 2, stable_count: int = 3):
+        """
+        通过内容稳定检测判断 AI 是否输出完成。
+        连续 stable_count 次内容不变则认为完成。
+        """
+        import time
+
+        last_content = ""
+        stable = 0
+
+        while time.time() < deadline:
+            await asyncio.sleep(check_interval)
+            try:
+                current = await page.evaluate("""() => document.body.innerText.length""")
+            except Exception:
+                current = 0
+
+            if current == last_content and current > 0:
+                stable += 1
+                if stable >= stable_count:
+                    return
+            else:
+                stable = 0
+            last_content = current
+
+        # 超时也不报错，交给上层处理
+
+    async def _extract_last_response(self, page: Page, selector: str,
+                                     timeout_ms: int, ai_name: str = "",
+                                     reply_count_before: int = -1,
+                                     sent_message: str = "",
+                                     init_markers: list = None) -> str:
+        """
+        提取最新一条 AI 回复的完整纯文本（排除思考过程和工具发送的消息）。
+
+        核心策略：
+        1. 在页面上找到所有"回复区块"
+        2. 如果传入了 reply_count_before，只取索引 >= reply_count_before 的区块（新回复）
+        3. 排除思考过程区块
+        4. 排除与发送消息内容匹配的区块（工具发送的消息）
+        5. 取最后一个有效区块的完整 innerText
+
+        关键：提取容器的完整文本，而非逐个子元素，避免只拿到末尾段落。
+
+        Args:
+            page: Playwright Page
+            selector: 最新回复选择器
+            timeout_ms: 超时（毫秒）
+            ai_name: AI 名称（用于日志）
+            init_markers: 初始化提示特征词列表，用于排除开场白容器
+
+        Returns:
+            str: 完整回复纯文本（不含思考过程）
+        """
+        prefix = f"[{ai_name}] " if ai_name else ""
+        # 初始化提示特征词（用于排除开场白容器，避免误提取）
+        init_markers = init_markers or []
+
+        # 主策略：JS 智能提取（过滤思考过程 + 排除工具发送的消息）
+        log_info(f"{prefix}使用 JS 智能提取（取完整回复容器，reply_count_before={reply_count_before}）")
+        try:
+            text = await page.evaluate("""({replyCountBefore, sentMessage, initMarkers}) => {
+                // ---- 思考过程检测 ----
+                const THINKING_KEYWORDS = [
+                    '分析输入', '构思回复', '起草回复', '对照约束',
+                    '思考过程', '深度思考', '最终润色',
+                    'Thought', 'Analysis', 'Reasoning',
+                ];
+
+                function isThinkingElement(el) {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    // 统一过滤所有含 think 的类名（包括通义千问的 thinkingContent）
+                    if (cls.includes('think')) return true;
+                    if (cls.includes('reasoning') || cls.includes('chain-of-thought') || cls.includes('cot-')) return true;
+                    if (cls.includes('ds-markdown--block') || cls.includes('ds-thinking')) return true;
+                    // 通义千问: data-card_name="deep_think" 属性标识思考卡片
+                    const cardName = el.getAttribute('data-card_name') || el.getAttribute('data-card-name') || '';
+                    if (cardName && cardName.toLowerCase().includes('think')) return true;
+                    // 通义千问: "深度思考已完成" 标题
+                    if (el.querySelector) {
+                        const titleEl = el.querySelector('.text-caption, span');
+                        if (titleEl && titleEl.textContent && titleEl.textContent.includes('深度思考')) return true;
+                    }
+                    // 检查祖先链（思考块可能多层嵌套）
+                    let p = el.parentElement;
+                    let depth = 0;
+                    while (p && depth < 5) {
+                        const pcls = (p.className || '').toString().toLowerCase();
+                        if (pcls.includes('think') || pcls.includes('reasoning') || 
+                            pcls.includes('ds-markdown--block') || pcls.includes('ds-thinking')) return true;
+                        // 祖先有 data-card_name="deep_think"
+                        const pCardName = p.getAttribute && (p.getAttribute('data-card_name') || p.getAttribute('data-card-name') || '');
+                        if (pCardName && pCardName.toLowerCase().includes('think')) return true;
+                        p = p.parentElement;
+                        depth++;
+                    }
+                    return false;
+                }
+
+                // ---- UI 元素检测 ----
+                function isUIElement(el) {
+                    const tag = el.tagName.toLowerCase();
+                    if (tag === 'button' || tag === 'a' || tag === 'input') return true;
+                    const role = el.getAttribute('role');
+                    if (role === 'button' || role === 'menuitem' || role === 'link') return true;
+                    const cls = (el.className || '').toString().toLowerCase();
+                    if (cls.includes('toolbar') || cls.includes('action') || cls.includes('footer-action')) return true;
+                    return false;
+                }
+
+                // ---- UI 标签黑名单（通义千问等平台的UI元素，非AI回复） ----
+                const UI_LABEL_BLOCKLIST = new Set([
+                    '录音纪要', '语音输入', '新建对话', '清空对话', '上传文件',
+                    '发送消息', '停止生成', '重新生成', '分享对话', '导出对话',
+                    '复制', '点赞', '踩', '收藏', '更多', '展开', '收起',
+                    '我的空间', '智能体', '对话分组', '新分组', '最近对话',
+                    'Qwen9953', '新建聊天', '历史记录', '设置', '帮助',
+                    '模型', '温度', '最大长度', '顶部', '停止',
+                    '回复', '继续生成', '查看更多', '加载更多',
+                    '搜索', '首页', '发现', '消息', '我的', '个人中心',
+                    '全部', '未读', '已读', '置顶',
+                    '深度思考已完成', '深度思考', '思考已完成',
+                    'AI生视频',
+                    // 智谱清言文件管理UI
+                    '全选', '取消', '删除', '已选', '下载', '重命名',
+                ]);
+
+                // ---- 正则黑名单：匹配"回复1/4"等分段UI标签 ----
+                function isUIReplyLabel(el) {
+                    const text = (el.innerText || '').trim();
+                    // 匹配 "回复N/M" 格式（MiniMax分段回复标签）
+                    if (/^回复\d+\/\d+$/.test(text)) return true;
+                    // 匹配 "N/M" 纯数字分页
+                    if (/^\d+\/\d+$/.test(text)) return true;
+                    return false;
+                }
+
+                // ---- 检测侧边栏/导航栏内容 ----
+                // 如果文本中包含多个UI标签（换行分隔），说明是侧边栏
+                function isSidebarContent(el) {
+                    const text = (el.innerText || '').trim();
+                    if (text.length === 0) return false;
+                    const lines = text.split(String.fromCharCode(10)).map(s => s.trim()).filter(s => s.length > 0);
+                    if (lines.length < 2) return false;
+
+                    // 检查1：超过一半的行是已知UI标签
+                    let labelCount = 0;
+                    for (const line of lines) {
+                        if (UI_LABEL_BLOCKLIST.has(line)) labelCount++;
+                    }
+                    if (lines.length >= 3 && labelCount >= lines.length * 0.5) return true;
+
+                    // 检查2：短行模式（侧边栏历史记录特征）
+                    // 所有行都很短（<30字），且总内容<200字，很可能是侧边栏
+                    if (lines.length >= 3 && text.length < 200) {
+                        let shortLineCount = 0;
+                        for (const line of lines) {
+                            if (line.length <= 30) shortLineCount++;
+                        }
+                        if (shortLineCount >= lines.length * 0.8) return true;
+                    }
+
+                    // 检查3：Kimi侧边栏历史记录特征
+                    // 每行都是一个独立的话题标题（无标点、无句子结构）
+                    if (lines.length >= 2 && text.length < 300) {
+                        let titleLikeCount = 0;
+                        for (const line of lines) {
+                            // 标题特征：短、无句号/问号/感叹号、无逗号分隔的长句
+                            if (line.length <= 50 && !/[。！？.!?,，；;]/.test(line)) {
+                                titleLikeCount++;
+                            }
+                        }
+                        if (titleLikeCount >= lines.length * 0.8) return true;
+                    }
+
+                    return false;
+                }
+
+                // ---- 检测广告/推广内容 ----
+                function isAdContent(el) {
+                    const text = (el.innerText || '').trim();
+                    if (text.length === 0) return false;
+                    // 智谱清言广告
+                    if (text.includes('GLM-') && text.includes('旗舰模型')) return true;
+                    if (text.includes('扫描二维码') && text.includes('体验')) return true;
+                    if (text.includes('保存名片') || text.includes('分享智能体')) return true;
+                    // 通用广告模式
+                    if (text.includes('点击体验') || text.includes('立即下载')) return true;
+                    if (text.includes('升级会员') || text.includes('开通会员')) return true;
+                    return false;
+                }
+
+                // ---- 检测文件附件标签 ----
+                // AI回复中可能包含上传文件的附件标签（如"HuaShanLunJian_技术文档.txt 36KB"）
+                // 这些不是AI的实际回复内容
+                function isFileAttachment(el) {
+                    const text = (el.innerText || '').trim();
+                    if (text.length === 0) return false;
+                    // 纯文件名+大小标签（如"文件名.txt 36KB"或"文件名.txt" + 换行 + "36KB"）
+                    if (/^[\w\u4e00-\u9fff\-_.]+\.(txt|md|csv|pdf|docx?|xlsx?|pptx?|zip|rar)[\s\S]*\d+(KB|MB|GB|B)$/i.test(text)) return true;
+                    // 纯文件名（无大小）
+                    if (/^[\w\u4e00-\u9fff\-_.]+\.(txt|md|csv|pdf|docx?|xlsx?|pptx?|zip|rar)$/i.test(text) && text.length < 100) return true;
+                    // 包含文件大小标签且很短
+                    if (/\d+(KB|MB|GB)\s*$/i.test(text) && text.length < 50) return true;
+                    return false;
+                }
+
+                // ---- Kimi 等平台的占位符/提示词黑名单 ----
+                // 这些是输入框占位符、模型选择器文字等，不是AI回复
+                const PLACEHOLDER_TEXTS = [
+                    '问点难的，让我多想一步',
+                    '输入 "/" 唤起插件和技能',
+                    'K2.6 思考',
+                    'K2.6 快速',
+                    'K1.5 思考',
+                    'K1.5 快速',
+                    '高峰时段算力不足',
+                    '升级会员畅用思考模型',
+                    '已切换至',
+                    '算力不足',
+                    '深度思考已完成',
+                    '深度思考',
+                    '思考已完成',
+                    // 通义千问 UI 标签
+                    'PPT创作',
+                    'AI生视频',
+                    'AI生图',
+                    '智能体',
+                    // 智谱清言文件管理 UI
+                    '全选', '取消', '删除', '已选', '下载', '重命名',
+                    '全选已选',
+                    // 豆包 UI 标签
+                    '发消息...', '快速新', '下载电脑版',
+                    'PPT 生成', '图像生成', '帮我写作',
+                    '视频生成', '深入研究', '录音转写',
+                    '音乐生成', '解题答疑', 'AI 播客',
+                    '数据分析',
+                ];
+                function isPlaceholderText(el) {
+                    const text = (el.innerText || '').trim();
+                    for (const p of PLACEHOLDER_TEXTS) {
+                        // 完全匹配或文本就是占位符本身
+                        if (text === p) return true;
+                        // 文本以占位符开头且很短（模型选择器可能带箭头图标文字）
+                        if (text.length < 30 && text.startsWith(p)) return true;
+                    }
+                    return false;
+                }
+                function isUILabel(el) {
+                    const text = (el.innerText || '').trim();
+                    // 短文本（<=10字）且完全匹配黑名单 → 是UI标签
+                    if (text.length <= 10 && UI_LABEL_BLOCKLIST.has(text)) return true;
+                    return false;
+                }
+
+                // ---- 初始化提示检测（排除开场白/系统提示词容器） ----
+                function isInitPrompt(el, markers) {
+                    if (!markers || markers.length === 0) return false;
+                    const text = (el.innerText || '').trim();
+                    if (text.length < 20) return false;
+                    // 匹配任意一个特征词即可判定为初始化提示
+                    for (const m of markers) {
+                        if (m && text.includes(m)) return true;
+                    }
+                    return false;
+                }
+
+                // ---- 工具发送的消息检测 ----
+                // sentMessage 是工具发送的原始消息，排除与其内容匹配的区块
+                function isSentMessage(el, sentMsg) {
+                    if (!sentMsg) return false;
+                    const text = (el.innerText || '').trim();
+                    // 完全匹配
+                    if (text === sentMsg.trim()) return true;
+                    // 发送消息是区块内容的一部分（工具消息可能被拆分成多段）
+                    if (text.length > 0 && sentMsg.trim().includes(text) && text.length > sentMsg.length * 0.5) return true;
+                    // 区块内容是发送消息的一部分
+                    if (text.length > 0 && text.includes(sentMsg.trim()) && text.length < sentMsg.length * 1.5) return true;
+                    return false;
+                }
+
+                // ---- 检测发送的prompt区块（含轮次标题的模式）----
+                // 工具发送的prompt以"【第N轮 - 军师发言】"或"【第N轮 - 谋士发言】"开头
+                // AI回复不会以这种格式开头（AI回复前缀是"[第N轮]"由工具添加）
+                function isSentPromptBlock(el) {
+                    const text = (el.innerText || '').trim();
+                    if (text.length === 0) return false;
+                    // 匹配"【第N轮 - 军师/谋士发言】"开头
+                    if (/^【第\d+轮\s*-\s*(军师|谋士)发言】/.test(text.substring(0, 30))) return true;
+                    // 匹配"【讨论话题】"开头（第一轮prompt）
+                    if (text.startsWith('【讨论话题】')) return true;
+                    // 匹配"【主公追问】"开头
+                    if (text.startsWith('【主公追问】')) return true;
+                    // 匹配"【上一轮"开头
+                    if (text.startsWith('【上一轮')) return true;
+                    // 匹配"【军师"开头（谋士prompt中的军师发言段）
+                    if (text.startsWith('【军师') && text.length < 200) return true;
+                    // 匹配"【第N轮 - 军师发言】"在内容前30字
+                    if (/【第\d+轮\s*-\s*(军师|谋士)发言】/.test(text.substring(0, 50))) return true;
+                    return false;
+                }
+
+                // ---- 用户消息检测（通过DOM属性区分用户消息和AI回复） ----
+                function isUserMessage(el) {
+                    // 检查元素自身及祖先是否有用户角色标识
+                    const userPatterns = ['user', 'me', 'human', 'question', 'prompt'];
+                    // 检查 data-role 属性
+                    const dataRole = el.getAttribute('data-role') || '';
+                    if (dataRole === 'user') return true;
+                    // 检查 class 属性
+                    const className = el.className || '';
+                    if (typeof className === 'string') {
+                        for (const p of userPatterns) {
+                            if (className.toLowerCase().includes(p) && !className.toLowerCase().includes('assistant')) return true;
+                        }
+                    }
+                    // 检查父元素（最多向上3层）
+                    let parent = el.parentElement;
+                    for (let i = 0; i < 3 && parent; i++) {
+                        const pClass = parent.className || '';
+                        const pRole = parent.getAttribute('data-role') || '';
+                        if (pRole === 'user') return true;
+                        if (typeof pClass === 'string') {
+                            for (const p of userPatterns) {
+                                if (pClass.toLowerCase().includes(p) && !pClass.toLowerCase().includes('assistant')) return true;
+                            }
+                        }
+                        parent = parent.parentElement;
+                    }
+                    return false;
+                }
+
+                // ---- 查找回复区块 ----
+                const containerSelectors = [
+                    '.ds-markdown--content',
+                    'div[class*="message-content"]:not([class*="think"])',
+                    'div[class*="markdown-body"]:not([class*="think"])',
+                    'div[class*="markdown-container"]',
+                    // 通义千问: generic markdown container (covers ds-markdown, markdown-item, etc.)
+                    'div[class*="markdown"]:not([class*="think"]):not([class*="input"]):not([class*="editor"])',
+                    'div[class*="message__content"]',
+                    'div[class*="answer-content"]',
+                    'div[class*="reply-content"]',
+                    // 通义千问: conversation/chat item containers
+                    'div[class*="conversation-item"]:not([class*="input"])',
+                    'div[class*="chat-item"]:not([class*="input"])',
+                    'div[class*="bubble"]:not([class*="input"]):not([class*="toolbar"])',
+                    'div[data-role="assistant"]',
+                    'article',
+                ];
+
+                let containers = [];
+                for (const sel of containerSelectors) {
+                    const found = document.querySelectorAll(sel);
+                    for (const el of found) {
+                        if (el.closest('textarea, input, button, [class*="search"], [class*="input-area"], [class*="chat-editor"], [class*="chat-input"], [class*="model-name"], [class*="current-model"], [class*="send-button"], [class*="chat-editor-action"], [class*="left-area"], [class*="right-area"], [class*="sidebar"], [class*="nav"], [class*="menu"], [class*="history"], [class*="conversation-list"], nav, aside')) continue;
+                        if (isThinkingElement(el)) continue;
+                        if (isUIElement(el)) continue;
+                        if (isUILabel(el)) continue;
+                        if (isUIReplyLabel(el)) continue;
+                        if (isPlaceholderText(el)) continue;
+                        if (isSidebarContent(el)) continue;
+                        if (isAdContent(el)) continue;
+                        if (isFileAttachment(el)) continue;
+                        if (isUserMessage(el)) continue;
+                        if (isSentPromptBlock(el)) continue;
+                        if (isInitPrompt(el, initMarkers)) continue;
+                        // 排除工具发送的消息
+                        if (isSentMessage(el, sentMessage)) continue;
+                        const text = (el.innerText || '').trim();
+                        if (text.length < 2) continue;
+                        containers.push(el);
+                    }
+                }
+
+                // 去重：移除被其他容器包含的子元素
+                let uniqueContainers = [];
+                for (const el of containers) {
+                    let isChild = false;
+                    for (const other of containers) {
+                        if (other !== el && other.contains(el)) {
+                            isChild = true;
+                            break;
+                        }
+                    }
+                    if (!isChild) {
+                        uniqueContainers.push(el);
+                    }
+                }
+
+                // 按页面位置排序
+                uniqueContainers.sort((a, b) => {
+                    const ra = a.getBoundingClientRect();
+                    const rb = b.getBoundingClientRect();
+                    return ra.top - rb.top;
+                });
+
+                // 如果传入了 replyCountBefore，只取新回复
+                if (replyCountBefore >= 0 && uniqueContainers.length > replyCountBefore) {
+                    const newContainers = uniqueContainers.slice(replyCountBefore);
+                    // 只有一个新容器，直接用
+                    if (newContainers.length === 1) {
+                        return (newContainers[0].innerText || '').trim();
+                    }
+                    // 多个新容器：优先选最后一个（通常是正文，而非思考块）
+                    // 因为思考块在DOM中通常出现在正文之前
+                    // 只有当最后一个太短(<50字)时才回退到选最长
+                    let bestEl = newContainers[newContainers.length - 1];
+                    let bestLen = (bestEl.innerText || '').trim().length;
+                    if (bestLen < 50) {
+                        // 最后一个太短，可能选到UI元素，回退到选最长
+                        for (const el of newContainers) {
+                            const t = (el.innerText || '').trim().length;
+                            if (t > bestLen) {
+                                bestEl = el;
+                                bestLen = t;
+                            }
+                        }
+                    }
+                    return (bestEl.innerText || '').trim();
+                }
+
+                // 回退：优先取最后一个（正文在思考之后）
+                if (uniqueContainers.length > 0) {
+                    if (uniqueContainers.length === 1) {
+                        return (uniqueContainers[0].innerText || '').trim();
+                    }
+                    // 优先取最后一个，太短才回退到最长
+                    let bestEl = uniqueContainers[uniqueContainers.length - 1];
+                    let bestLen = (bestEl.innerText || '').trim().length;
+                    if (bestLen < 50) {
+                        for (const el of uniqueContainers) {
+                            const t = (el.innerText || '').trim().length;
+                            if (t > bestLen) {
+                                bestEl = el;
+                                bestLen = t;
+                            }
+                        }
+                    }
+                    return (bestEl.innerText || '').trim();
+                }
+
+                // 更宽泛的回退（也排除发送消息和UI标签）
+                const fallbackSelectors = [
+                    '[class*="content"]:not([class*="input"]):not([class*="search"]):not([class*="think"])',
+                    '[class*="message"]:not([class*="input"])',
+                ];
+                let fallbackCandidates = [];
+                for (const sel of fallbackSelectors) {
+                    const found = document.querySelectorAll(sel);
+                    for (let i = found.length - 1; i >= 0; i--) {
+                        const el = found[i];
+                        if (el.closest('textarea, input, button, [class*="search"], [class*="input-area"]')) continue;
+                        if (isThinkingElement(el)) continue;
+                        if (isUIElement(el)) continue;
+                        if (isUILabel(el)) continue;
+                        if (isPlaceholderText(el)) continue;
+                        if (isUIReplyLabel(el)) continue;
+                        if (isSidebarContent(el)) continue;
+                        if (isAdContent(el)) continue;
+                        if (isFileAttachment(el)) continue;
+                        if (isInitPrompt(el, initMarkers)) continue;
+                        if (isSentMessage(el, sentMessage)) continue;
+                        if (isSentPromptBlock(el)) continue;
+                        if (isUserMessage(el)) continue;
+                        const text = (el.innerText || '').trim();
+                        if (text.length > 0) fallbackCandidates.push(el);
+                    }
+                }
+                // 回退也优先选最长的
+                if (fallbackCandidates.length > 0) {
+                    let bestEl = fallbackCandidates[0];
+                    let bestLen = (bestEl.innerText || '').trim().length;
+                    for (const el of fallbackCandidates) {
+                        const t = (el.innerText || '').trim().length;
+                        if (t > bestLen) {
+                            bestEl = el;
+                            bestLen = t;
+                        }
+                    }
+                    return (bestEl.innerText || '').trim();
+                }
+
+                return '';
+            }""", {"replyCountBefore": reply_count_before, "sentMessage": sent_message, "initMarkers": init_markers})
+
+            text = clean_text(text)
+            if text and len(text) >= 2:
+                log_info(f"{prefix}JS 智能提取成功（长度 {len(text)}）: {text[:100]}...")
+                return text
+            elif text and len(text) >= 1:
+                log_warning(f"{prefix}JS 智能提取结果过短（{len(text)}字: {text[:50]}），尝试其他策略")
+                # 不返回，继续尝试配置选择器
+            else:
+                log_warning(f"{prefix}JS 智能提取结果为空")
+        except Exception as e:
+            log_warning(f"{prefix}JS 智能提取失败: {e}")
+
+        # 备选策略1：配置的选择器
+        if selector:
+            log_info(f"{prefix}尝试配置的回复选择器: {selector}")
+            try:
+                elements = await page.query_selector_all(selector)
+                # 第一轮：从后往前找第一个可见且有内容的元素
+                best_text = ""
+                best_len = 0
+                all_visible_texts = []
+                for el in reversed(elements):
+                    try:
+                        if await el.is_visible():
+                            text = await el.inner_text()
+                            text = clean_text(text)
+                            if text and len(text) >= 1 and not self._is_thinking_content(text):
+                                if len(text) > best_len:
+                                    best_text = text
+                                    best_len = len(text)
+                                all_visible_texts.append(text)
+                    except Exception:
+                        continue
+
+                if best_text:
+                    # 如果最佳结果较短，尝试拼接所有匹配元素
+                    if best_len < 200 and len(all_visible_texts) > 1:
+                        combined = "\n\n".join(reversed(all_visible_texts))
+                        combined = clean_text(combined)
+                        if len(combined) > best_len:
+                            log_info(f"{prefix}配置选择器拼接{len(all_visible_texts)}个元素成功: {len(combined)}字")
+                            return combined
+                    log_info(f"{prefix}配置选择器提取成功: {best_text[:80]}...")
+                    return best_text
+            except Exception as e:
+                log_warning(f"{prefix}配置选择器提取失败: {e}")
+
+            # 备选策略1b：去掉 :last-of-type 后缀，获取所有匹配元素拼接
+            if ":last-of-type" in selector:
+                broad_selector = selector.replace(":last-of-type", "")
+                try:
+                    elements = await page.query_selector_all(broad_selector)
+                    if elements:
+                        all_texts = []
+                        for el in elements:
+                            try:
+                                if await el.is_visible():
+                                    text = await el.inner_text()
+                                    text = clean_text(text)
+                                    if text and len(text) >= 5 and not self._is_thinking_content(text):
+                                        all_texts.append(text)
+                            except Exception:
+                                continue
+                        if all_texts:
+                            combined = "\n\n".join(all_texts)
+                            combined = clean_text(combined)
+                            if len(combined) > 50:
+                                log_info(f"{prefix}宽选择器拼接{len(all_texts)}个元素成功: {len(combined)}字")
+                                return combined
+                except Exception as e:
+                    log_warning(f"{prefix}宽选择器提取失败: {e}")
+
+        # 备选策略2：通用 DOM 提取
+        log_info(f"{prefix}尝试通用 DOM 提取")
+        text = await self._extract_generic_response(page, ai_name)
+        if text and len(text) >= 1 and not self._is_thinking_content(text):
+            log_info(f"{prefix}通用提取成功: {text[:80]}...")
+            return text
+
+        log_error(f"{prefix}所有提取策略均失败，返回空字符串")
+        return ""
+
+    @staticmethod
+    def _is_thinking_content(text: str) -> bool:
+        """判断文本是否为 AI 的思考过程（而非最终回复）。"""
+        if not text:
+            return False
+        thinking_keywords = [
+            '分析输入', '构思回复', '起草回复', '对照约束',
+            '思考过程', '深度思考', '最终润色',
+            'Thought', 'Analysis', 'Reasoning',
+            # 智谱清言/通义千问等AI的思考格式
+            'Role:', 'Goal:', 'Strategy:', 'Current State:',
+            'Drafting the Response', 'Key Points to Make',
+            'Response Structure', 'Summary of Conflict',
+            'Analysis of Disagreements', 'Phase 1:', 'Phase 2:',
+            'Action:', 'Direct the next round',
+            # 扩充：通义千问/其他AI的思考格式
+            'The user', 'The project', 'The lord', 'I need to',
+            'This is', 'Let me', 'I should', 'I will',
+            '【思考】', '【分析】', '【推理】',
+            '已深度思考', 'Thought for', '思考完成',
+            'Step 1:', 'Step 2:', 'Step 3:',
+            'First,', 'Second,', 'Third,',
+            'Now I', 'Based on', 'Looking at',
+        ]
+        # 强信号关键词：单独出现即可判定
+        strong_signals = [
+            'Role:', 'Goal:', 'Strategy:', 'Current State:',
+            'Drafting the Response', 'Key Points to Make',
+            '分析输入', '构思回复', '起草回复',
+            '已深度思考', 'Thought for', '思考完成',
+            '【思考】', '【分析】', '【推理】',
+        ]
+        # 检查文本前几行是否包含思考关键词
+        first_lines = text.strip().split('\n')[:12]
+        keyword_count = 0
+        for line in first_lines:
+            for kw in thinking_keywords:
+                if kw in line:
+                    keyword_count += 1
+                    break
+        # 强信号：前12行中任意1行命中即判定
+        for line in first_lines:
+            for kw in strong_signals:
+                if kw in line:
+                    return True
+        # 普通信号：前12行中有2行以上包含思考关键词（从3降低到2）
+        return keyword_count >= 2
+
+    @staticmethod
+    def _strip_thinking_content(text: str, ai_name: str = "") -> str:
+        """
+        后处理：从提取的文本中移除残留的思考过程内容。
+
+        策略：
+        1. 如果整段文本都是思考过程，尝试找到实际回复部分
+        2. 移除以思考关键词开头的段落
+        3. 移除 *分析输入：* / *构思回复：* 等标记段落
+        """
+        if not text:
+            return text
+
+        prefix = f"[{ai_name}] " if ai_name else ""
+
+        # 先用快速检测：如果文本不是思考内容，直接返回
+        if not ChromeManager._is_thinking_content(text):
+            # 仍然过滤 UI 元素文字
+            return ChromeManager._strip_ui_elements(text, ai_name)
+
+        # 文本被判定为思考内容，尝试找到实际回复部分
+        lines = text.split('\n')
+
+        # 策略1: 查找中文方括号【开头的行（通常是正式回复的标题）
+        reply_start_idx = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('【') and len(stripped) > 5:
+                reply_start_idx = i
+                break
+
+        # 策略2: 如果没找到【, 查找最后一个"一、二、三、"等中文序号开头
+        if reply_start_idx == -1:
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith('一、') or stripped.startswith('二、') or stripped.startswith('三、'):
+                    reply_start_idx = i
+                    break
+
+        # 策略3: 如果没找到，查找以AI名称开头的正式回复行
+        if reply_start_idx == -1 and ai_name:
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith(f'{ai_name}：') or stripped.startswith(f'{ai_name}:') or stripped.startswith(f'【{ai_name}'):
+                    reply_start_idx = i
+                    break
+
+        # 策略4: 查找 "各位" 开头的行（军师常用开场白）
+        if reply_start_idx == -1:
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith('各位谋士') or stripped.startswith('各位同僚') or stripped.startswith('主公'):
+                    reply_start_idx = i
+                    break
+
+        if reply_start_idx >= 0:
+            result = '\n'.join(lines[reply_start_idx:]).strip()
+            log_info(f"{prefix}后处理：检测到思考内容，从第{reply_start_idx+1}行截取实际回复，从 {len(text)} 字符中提取 {len(result)} 字符")
+            return ChromeManager._strip_ui_elements(result, ai_name)
+
+        # 策略5: 无法找到明确的回复起始点，使用原有的行级过滤
+        thinking_markers = [
+            '分析输入', '构思回复', '起草回复', '对照约束',
+            '思考过程', '深度思考', '最终润色',
+            '*分析输入', '*构思回复', '*起草回复', '*对照约束',
+            'Thought', 'Analysis', 'Reasoning',
+            'Role:', 'Goal:', 'Strategy:', 'Current State:',
+            'Drafting the Response', 'Key Points to Make',
+            'Response Structure', 'Summary of Conflict',
+            'Analysis of Disagreements', 'Phase 1:', 'Phase 2:',
+            'Phase 3:', 'Phase 4:', 'Action:',
+            'Direct the next round', 'Focus for next round',
+        ]
+
+        cleaned_lines = []
+        in_thinking_block = False
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+
+            is_thinking_line = False
+            for marker in thinking_markers:
+                if stripped.startswith(marker) or stripped.startswith(f'*{marker}'):
+                    is_thinking_line = True
+                    break
+
+            if is_thinking_line:
+                in_thinking_block = True
+                continue
+
+            if in_thinking_block:
+                if not stripped:
+                    in_thinking_block = False
+                elif stripped.startswith('*') or stripped.startswith('-') or stripped.startswith('•'):
+                    continue
+                else:
+                    in_thinking_block = False
+                    cleaned_lines.append(line)
+            else:
+                cleaned_lines.append(line)
+
+        result = '\n'.join(cleaned_lines).strip()
+
+        if len(result) < 20 and len(text) > 100:
+            for i in range(len(lines) - 1, -1, -1):
+                stripped = lines[i].strip()
+                if stripped and not any(stripped.startswith(m) for m in thinking_markers):
+                    reply_start = i
+                    for j in range(i - 1, -1, -1):
+                        jstripped = lines[j].strip()
+                        if any(jstripped.startswith(m) for m in thinking_markers):
+                            break
+                        reply_start = j
+                    result = '\n'.join(lines[reply_start:]).strip()
+                    break
+
+        if result != text:
+            log_info(f"{prefix}后处理：从 {len(text)} 字符中过滤思考内容，剩余 {len(result)} 字符")
+
+        return ChromeManager._strip_ui_elements(result, ai_name)
+
+    @staticmethod
+    def _strip_ui_elements(text: str, ai_name: str = "") -> str:
+        """过滤网页 UI 元素文字。"""
+        if not text:
+            return text
+
+        # 过滤网页 UI 元素文字
+        ui_keywords = [
+            'AI编辑', '收藏至知识库', '收藏', '编辑', '复制', '分享',
+            '点赞', '重新生成', '停止生成', '继续生成',
+            'Copy', 'Edit', 'Share', 'Regenerate',
+        ]
+        lines = text.split('\n')
+        cleaned = [line for line in lines if not any(kw in line.strip() for kw in ui_keywords) or len(line.strip()) > 30]
+        result = '\n'.join(cleaned).strip()
+
+        return result if result else text
+
+    async def _extract_generic_response(self, page: Page, ai_name: str = "") -> str:
+        """通用回复提取：使用多种选择器获取最后一条 AI 回复（过滤思考过程）。"""
+        prefix = f"[{ai_name}] " if ai_name else ""
+
+        # 多种选择器尝试
+        extract_selectors = [
+            # DeepSeek 风格（排除 thinking block）
+            "div[class*='message-content']:not([class*='think'])",
+            "div.ds-markdown:not(.ds-markdown--block)",
+            "div[class*='markdown-body']:not([class*='think'])",
+            # 通义千问: generic markdown container
+            "div[class*='markdown']:not([class*='think']):not([class*='input']):not([class*='editor'])",
+            # 智谱清言 风格
+            "div[class*='answer']:not([class*='think'])",
+            "div[class*='reply-content']:not([class*='think'])",
+            # 通用
+            "div[data-role='assistant']:not([class*='think'])",
+            "article:not([class*='think'])",
+        ]
+
+        for sel in extract_selectors:
+            try:
+                elements = await page.query_selector_all(sel)
+                # 从后往前找第一个非思考内容
+                for el in reversed(elements):
+                    try:
+                        text = await el.inner_text()
+                        text = clean_text(text)
+                        if text and len(text) >= 1 and not self._is_thinking_content(text):
+                            log_info(f"{prefix}选择器 '{sel}' 提取成功: {text[:80]}...")
+                            return text
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # 最终回退：JS 获取所有文本容器的最后一条（过滤思考）
+        try:
+            text = await page.evaluate("""() => {
+                const THINKING_KEYWORDS = [
+                    '分析输入', '构思回复', '起草回复', '对照约束',
+                    '思考过程', '深度思考', '最终润色',
+                ];
+                const elements = document.querySelectorAll(
+                    '[class*="message"], [class*="markdown"], [data-role="assistant"], article, ' +
+                    '[class*="answer"], [class*="response"], [class*="reply"]'
+                );
+                // 从后往前找第一个非思考内容
+                for (let i = elements.length - 1; i >= 0; i--) {
+                    const el = elements[i];
+                    const cls = (el.className || '').toString().toLowerCase();
+                    if (cls.includes('think') || cls.includes('reasoning')) continue;
+                    const text = el.innerText.trim();
+                    if (text.length < 1) continue;
+                    let kwCount = 0;
+                    for (const kw of THINKING_KEYWORDS) {
+                        if (text.includes(kw)) kwCount++;
+                    }
+                    if (kwCount >= 2) continue;
+                    return text;
+                }
+                return '';
+            }""")
+            return clean_text(text)
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------
+    # 登录检测
+    # ------------------------------------------------------------------
+
+    async def check_login_status(self, page: Page, ai_config: dict) -> tuple:
+        """登录检测：双指标并行检测。
+
+        检测两个指标：
+        A. 否定指标：有可见的"登录"按钮 → 未登录
+        B. 肯定指标：localStorage 中有认证 token → 已登录
+
+        判定优先级：
+        1. 有登录按钮 → 未登录（否定优先）
+        2. 有 token → 已登录
+        3. 都没有 → 未登录（保守，防止误判）
+
+        支持 :has-text('xxx') 伪选择器（在 JS 中解析）。
+        每个 AI 可配置：
+        - logged_out_selector: 登录按钮选择器（支持 :has-text()）
+        - logged_in_selector: 已登录元素选择器（支持 :has-text()）
+        - auth_storage_keys: localStorage 认证 token 的 key 列表
+        """
+        selectors = ai_config.get("selectors", {})
+
+        try:
+            current_url = page.url
+        except Exception:
+            current_url = ""
+
+        # 1. URL 检测
+        if any(kw in current_url.lower() for kw in [
+            "login", "auth", "signin", "sign-in", "sign_in", "signup", "sign-up", "sign_up"
+        ]):
+            return "not_logged_in", "当前页面为登录页，请先登录"
+
+        # 2. 输入框检测
+        input_selector = selectors.get("input_textarea", "textarea")
+        input_el = await self._try_locate(page, input_selector, state="visible", timeout=3000)
+        if input_el is None:
+            return "not_logged_in", "无对话框（页面未加载或需登录）"
+
+        # 3. 等待 DOM 稳定
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=1500)
+        except Exception:
+            pass
+
+        # 4. JS 检测
+        logged_in_selector = selectors.get("logged_in_selector", "")
+        logged_out_selector = selectors.get("logged_out_selector", "")
+        auth_storage_keys = selectors.get("auth_storage_keys", [])
+
+        result = await page.evaluate("""
+            (config) => {
+                const r = {
+                    has_login_button: false,
+                    login_btn_text: '',
+                    has_auth_token: false,
+                    auth_key: '',
+                    has_user_element: false
+                };
+
+                // 辅助函数：解析 :has-text('xxx') 伪选择器
+                // 返回 {baseSelector: string, text: string|null}
+                function parseHasText(selector) {
+                    const m = selector.match(/^(.+?):has-text\\(['\"](.+?)['\"]\\)$/);
+                    if (m) return {base: m[1].trim(), text: m[2]};
+                    return {base: selector.trim(), text: null};
+                }
+
+                // 辅助函数：检查元素是否可见
+                function isVisible(el) {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+                    if (parseFloat(style.opacity) === 0) return false;
+                    return true;
+                }
+
+                // === 否定指标：登录按钮检测 ===
+                // 策略1：配置的选择器（支持 :has-text()）
+                if (config.logged_out_selector) {
+                    const sels = config.logged_out_selector.split(',').map(s => s.trim());
+                    for (const sel of sels) {
+                        try {
+                            const parsed = parseHasText(sel);
+                            if (parsed.text) {
+                                // 有 :has-text()：先找基础选择器，再检查文本
+                                const els = document.querySelectorAll(parsed.base);
+                                for (const el of els) {
+                                    if (el.textContent.trim().includes(parsed.text) && isVisible(el)) {
+                                        r.has_login_button = true;
+                                        r.login_btn_text = el.textContent.trim().slice(0, 20);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // 纯 CSS 选择器
+                                const el = document.querySelector(parsed.base);
+                                if (isVisible(el)) {
+                                    r.has_login_button = true;
+                                    r.login_btn_text = (el.textContent || '').trim().slice(0, 20);
+                                }
+                            }
+                            if (r.has_login_button) break;
+                        } catch(e) {}
+                    }
+                }
+                // 策略2：通用文本搜索（精确匹配）
+                if (!r.has_login_button) {
+                    const btns = document.querySelectorAll(
+                        'button, a, span[role="button"], div[role="button"]'
+                    );
+                    const loginTexts = ['登录', '登陆', '登入', '注册', '立即登录',
+                                       'Sign in', 'Sign up', 'Log in', 'Login'];
+                    for (const btn of btns) {
+                        const text = (btn.textContent || '').trim();
+                        if (text.length > 0 && text.length <= 10) {
+                            for (const kw of loginTexts) {
+                                if (text === kw && isVisible(btn)) {
+                                    r.has_login_button = true;
+                                    r.login_btn_text = text;
+                                    break;
+                                }
+                            }
+                            if (r.has_login_button) break;
+                        }
+                    }
+                }
+                // 策略3：class 包含 login-btn 的可见按钮
+                if (!r.has_login_button) {
+                    const btns = document.querySelectorAll(
+                        'button[class*="login"], a[class*="login"], [class*="login-btn"], [class*="loginBtn"]'
+                    );
+                    for (const btn of btns) {
+                        if (isVisible(btn)) {
+                            r.has_login_button = true;
+                            r.login_btn_text = 'class:' + (btn.className || '').toString().slice(0, 30);
+                            break;
+                        }
+                    }
+                }
+                // 策略4：aria-label
+                if (!r.has_login_button) {
+                    const btns = document.querySelectorAll(
+                        'button[aria-label], a[aria-label], div[role="button"][aria-label]'
+                    );
+                    for (const btn of btns) {
+                        const label = (btn.getAttribute('aria-label') || '').trim();
+                        if (label === '登录' || label === '登陆' || label === 'Sign in' || label === 'Login') {
+                            if (isVisible(btn)) {
+                                r.has_login_button = true;
+                                r.login_btn_text = 'aria:' + label;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // === 肯定指标1：localStorage token 检测 ===
+                if (config.auth_storage_keys && config.auth_storage_keys.length > 0) {
+                    for (const key of config.auth_storage_keys) {
+                        const val = localStorage.getItem(key);
+                        if (val && val.length > 10) {
+                            r.has_auth_token = true;
+                            r.auth_key = key;
+                            break;
+                        }
+                    }
+                }
+
+                // === 肯定指标2：用户元素检测（头像等，仅用配置选择器）===
+                if (config.logged_in_selector) {
+                    const sels = config.logged_in_selector.split(',').map(s => s.trim());
+                    for (const sel of sels) {
+                        try {
+                            const parsed = parseHasText(sel);
+                            if (parsed.text) {
+                                const els = document.querySelectorAll(parsed.base);
+                                for (const el of els) {
+                                    if (el.textContent.trim().includes(parsed.text) && isVisible(el)) {
+                                        r.has_user_element = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                const el = document.querySelector(parsed.base);
+                                if (isVisible(el)) {
+                                    r.has_user_element = true;
+                                }
+                            }
+                            if (r.has_user_element) break;
+                        } catch(e) {}
+                    }
+                }
+
+                return r;
+            }
+        """, {
+            "logged_in_selector": logged_in_selector,
+            "logged_out_selector": logged_out_selector,
+            "auth_storage_keys": auth_storage_keys,
+        })
+
+        # === 判定逻辑（三指标）===
+        has_login_button = result.get("has_login_button", False)
+        has_auth_token = result.get("has_auth_token", False)
+        has_user_element = result.get("has_user_element", False)
+
+        # 调试日志：输出检测结果到对应AI的日志文件
+        ai_name = ai_config.get("name", "未知")
+        log_ai(ai_name, f"登录检测: login_btn={has_login_button}({result.get('login_btn_text','')}), "
+                         f"token={has_auth_token}({result.get('auth_key','')}), "
+                         f"user_el={has_user_element}", "debug")
+
+        # 1. 有登录按钮 → 未登录（否定优先，覆盖一切）
+        if has_login_button:
+            btn_text = result.get("login_btn_text", "")
+            return "not_logged_in", f"检测到登录按钮（{btn_text}），请先登录"
+
+        # 2. 无登录按钮 + 有 token → 已登录
+        if has_auth_token:
+            return "logged_in", "已登录"
+
+        # 3. 无登录按钮 + 无 token + 有用户元素(头像等) → 已登录
+        if has_user_element:
+            return "logged_in", "已登录"
+
+        # 4. 无登录按钮 + 无 token + 无用户元素 + 对话框存在 → 已登录
+        # 走到这里说明：URL不含login、输入框可见(第2步已检测)、没有登录按钮
+        # 这三个条件同时满足，几乎可以确定已登录
+        # （token/user_element 选择器可能因网站改版而失效，但不影响登录判断）
+        return "logged_in", "已登录（通过对话框+无登录按钮判断）"
+
+    # ------------------------------------------------------------------
+    # 统一状态检测：对话框 + 登录（思考模式不作为变绿标准）
+    # 检测与操作完全分离：检测只读取状态，操作才执行点击
+    # ------------------------------------------------------------------
+
+    async def check_ai_ready(self, page: Page, ai_config: dict) -> tuple:
+        """统一检测 AI 是否就绪（检测 ONLY，不操作）。
+
+        检测两个条件（必须同时满足才变绿）：
+        1. 对话框存在（输入框可见）
+        2. 已登录（check_login_status 严格确认）
+
+        思考模式不作为变绿标准，但仍由 ui_worker 自动尝试启用。
+
+        Returns:
+            tuple: (status, reason)
+            status: "green" 或 "orange"
+            reason: 具体原因，用于 tooltip 显示
+        """
+        ai_name = ai_config.get("name", "未知")
+        selectors = ai_config.get("selectors", {})
+
+        # 直接检测登录状态（check_login_status 内部已检测对话框存在性）
+        login_status, login_msg = await self.check_login_status(page, ai_config)
+        if login_status != "logged_in":
+            return "orange", f"未登录（{login_msg}）"
+
+        # 已登录 → 变绿
+        return "green", "已就绪"
+
+    # ------------------------------------------------------------------
+    # 思考模式：检测（只读，不操作）
+    # ------------------------------------------------------------------
+
+    async def detect_thinking_mode(self, page: Page, ai_config: dict) -> tuple:
+        """检测思考模式是否已开启（只读取状态，不点击任何按钮）。
+
+        支持新配置格式（thinking_mode.detect）和旧格式（兼容）。
+
+        Returns:
+            tuple: (is_active: bool, reason: str)
+        """
+        ai_name = ai_config.get("name", "未知")
+        tm = ai_config.get("thinking_mode", {})
+
+        if not tm.get("enabled", False):
+            return True, "无需思考模式"
+
+        # 获取检测配置：优先新格式，兼容旧格式
+        detect_cfg = tm.get("detect", {})
+        if not detect_cfg:
+            # 兼容旧格式：从 thinking_mode 顶层提取
+            detect_cfg = {
+                "type": tm.get("type", "toggle"),
+                "selector": tm.get("selector", ""),
+                "label_selector": tm.get("label_selector", ""),
+                "label_text": tm.get("label_text", ""),
+                "active_attr": tm.get("active_attr", "aria-pressed"),
+                "active_value": tm.get("active_value", "true"),
+            }
+
+        detect_type = detect_cfg.get("type", "toggle")
+
+        try:
+            if detect_type == "dropdown":
+                label_selector = detect_cfg.get("label_selector", "")
+                label_text = detect_cfg.get("label_text", "")
+                if not label_selector:
+                    return False, "未配置检测选择器"
+
+                result = await page.evaluate("""
+                    (config) => {
+                        let labelEl = null;
+                        try { labelEl = document.querySelector(config.label_selector); } catch(e) {}
+                        if (!labelEl) return {found: false, label: ''};
+                        const label = (labelEl.textContent || '').trim();
+                        return {found: true, label: label, active: label.includes(config.label_text)};
+                    }
+                """, {"label_selector": label_selector, "label_text": label_text})
+
+                if not result or not result.get("found"):
+                    return False, "未找到模式标签（页面未加载完）"
+                if result.get("active"):
+                    return True, "思考模式已开启"
+                return False, f"当前模式: {result.get('label', '未知')}"
+
+            else:  # toggle
+                selector = detect_cfg.get("selector", "")
+                active_attr = detect_cfg.get("active_attr", "aria-pressed")
+                active_value = detect_cfg.get("active_value", "true")
+                label_text = detect_cfg.get("label_text", "")
+
+                if not selector:
+                    return False, "未配置检测选择器"
+
+                result = await page.evaluate("""
+                    (config) => {
+                        let toggle = null;
+                        try { toggle = document.querySelector(config.selector); } catch(e) {}
+                        if (!toggle && config.label_text) {
+                            const buttons = document.querySelectorAll('button, div[role="button"]');
+                            for (const btn of buttons) {
+                                const ariaLabel = btn.getAttribute('aria-label') || '';
+                                if (ariaLabel === config.label_text) { toggle = btn; break; }
+                            }
+                        }
+                        if (!toggle) return {found: false};
+                        const attrVal = toggle.getAttribute(config.active_attr);
+                        return {found: true, active: attrVal === config.active_value, attrVal: attrVal};
+                    }
+                """, {"selector": selector, "label_text": label_text,
+                      "active_attr": active_attr, "active_value": active_value})
+
+                if not result or not result.get("found"):
+                    return False, "未找到思考模式开关"
+                if result.get("active"):
+                    return True, "思考模式已开启"
+                return False, "思考模式未开启"
+
+        except Exception as e:
+            log_warning(f"[{ai_name}] 思考模式检测异常: {e}")
+            return False, f"检测异常: {e}"
+
+    # ------------------------------------------------------------------
+    # 思考模式：启用（只写，只操作不检测）
+    # ------------------------------------------------------------------
+
+    async def try_enable_thinking_mode(self, page: Page, ai_config: dict) -> tuple:
+        """尝试启用思考模式（执行操作步骤，不检测最终状态）。
+
+        执行 thinking_mode.enable_steps 中的每一步：
+        - click: 点击 selector 指定的元素
+        - wait: 等待指定毫秒
+        - click_text: 在 selector 范围内搜索包含 text 的元素并点击
+
+        启用后由调用方重新 detect 确认是否成功。
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        ai_name = ai_config.get("name", "未知")
+        tm = ai_config.get("thinking_mode", {})
+
+        if not tm.get("enabled", False):
+            return True, "无需思考模式"
+
+        # 操作锁
+        if ai_name in self._thinking_in_progress:
+            return False, "正在操作中"
+        self._thinking_in_progress.add(ai_name)
+
+        # 冷却检查：15秒内不重复尝试
+        import time
+        last_attempt = self._thinking_enable_cooldown.get(ai_name, 0)
+        if time.time() - last_attempt < 15:
+            return False, "自动切换冷却中（请手动开启或等待）"
+
+        try:
+            # 等待页面 DOM 稳定
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=1500)
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
+
+            steps = tm.get("enable_steps", [])
+
+            # 兼容旧格式：如果没有 enable_steps，从旧字段构建
+            if not steps:
+                tm_type = tm.get("type", "toggle")
+                if tm_type == "dropdown":
+                    steps = [
+                        {"action": "click", "selector": tm.get("selector", "")},
+                        {"action": "wait", "ms": 1000},
+                        {"action": "click_text", "text": tm.get("option_text", ""),
+                         "selector": tm.get("option_selector", "")},
+                        {"action": "wait", "ms": 800},
+                    ]
+                else:  # toggle
+                    steps = [
+                        {"action": "click", "selector": tm.get("selector", "")},
+                        {"action": "wait", "ms": 800},
+                    ]
+
+            for step in steps:
+                action = step.get("action", "")
+
+                if action == "click":
+                    selector = step.get("selector", "")
+                    if not selector:
+                        continue
+                    # 优先使用 Playwright 原生点击（trusted event），兼容 Radix UI 等 React 组件
+                    try:
+                        await page.click(selector, timeout=3000)
+                    except Exception:
+                        # 回退到 JS click
+                        await page.evaluate("""
+                            (sel) => {
+                                let el = null;
+                                try { el = document.querySelector(sel); } catch(e) {}
+                                if (el) el.click();
+                            }
+                        """, selector)
+
+                elif action == "wait":
+                    ms = step.get("ms", 500)
+                    await page.wait_for_timeout(ms)
+
+                elif action == "click_text":
+                    text = step.get("text", "")
+                    selector = step.get("selector", "")
+                    if not text:
+                        continue
+                    # 先通过 JS 找到目标元素的坐标，再用 Playwright 原生点击（trusted event）
+                    coords = await page.evaluate("""
+                        async (config) => {
+                            let found = null;
+                            // 策略1：使用 CSS 选择器范围搜索
+                            if (config.selector) {
+                                const opts = document.querySelectorAll(config.selector);
+                                for (const opt of opts) {
+                                    if (opt.textContent.trim().includes(config.text)) {
+                                        let target = opt;
+                                        for (let i = 0; i < 5; i++) {
+                                            if (!target) break;
+                                            const cls = (target.className || '').toString();
+                                            const role = target.getAttribute('role') || '';
+                                            if (cls.includes('item') || cls.includes('mode') ||
+                                                cls.includes('option') ||
+                                                role === 'option' || role === 'menuitem' ||
+                                                target.tagName === 'LI' || target.tagName === 'BUTTON') {
+                                                found = target;
+                                                break;
+                                            }
+                                            target = target.parentElement;
+                                        }
+                                        if (!found) found = opt;
+                                        break;
+                                    }
+                                }
+                            }
+                            // 策略2：全局文本匹配回退
+                            if (!found) {
+                                const allElements = document.querySelectorAll(
+                                    'div, li, span, button, a, p'
+                                );
+                                for (const el of allElements) {
+                                    const elText = (el.textContent || '').trim();
+                                    if (elText.includes(config.text) && elText.length < 50) {
+                                        const rect = el.getBoundingClientRect();
+                                        if (rect.width > 0 && rect.height > 0) {
+                                            let clickTarget = el;
+                                            let parent = el.parentElement;
+                                            for (let i = 0; i < 3; i++) {
+                                                if (!parent) break;
+                                                const pcls = (parent.className || '').toString();
+                                                const prole = parent.getAttribute('role') || '';
+                                                if (pcls.includes('item') || pcls.includes('option') ||
+                                                    pcls.includes('mode') ||
+                                                    prole === 'option' || prole === 'menuitem' ||
+                                                    parent.tagName === 'LI') {
+                                                    clickTarget = parent;
+                                                    break;
+                                                }
+                                                parent = parent.parentElement;
+                                            }
+                                            found = clickTarget;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (found) {
+                                const r = found.getBoundingClientRect();
+                                return {x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                            }
+                            return {found: false};
+                        }
+                    """, {"text": text, "selector": selector})
+
+                    if coords and coords.get("found"):
+                        # 使用 Playwright 原生鼠标点击（trusted event，兼容 Radix UI）
+                        await page.mouse.click(coords["x"], coords["y"])
+                    else:
+                        log_warning(f"click_text: 未找到包含 '{text}' 的元素")
+
+            # 记录本次尝试时间
+            self._thinking_enable_cooldown[ai_name] = time.time()
+            self._thinking_fail_count[ai_name] = self._thinking_fail_count.get(ai_name, 0) + 1
+
+            log_info(f"[{ai_name}] 思考模式启用步骤已执行（第{self._thinking_fail_count[ai_name]}次）")
+            return True, "操作已执行"
+
+        except Exception as e:
+            log_warning(f"[{ai_name}] 思考模式启用失败: {e}")
+            self._thinking_enable_cooldown[ai_name] = time.time()
+            return False, f"启用失败: {e}"
+        finally:
+            self._thinking_in_progress.discard(ai_name)
+
+    # ------------------------------------------------------------------
+    # 元素定位辅助
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _try_locate(page: Page, selector: str, state: str = "visible",
+                          timeout: int = 5000):
+        """
+        尝试定位元素，支持多种选择器语法。
+
+        优先尝试 Playwright 的 wait_for_selector（支持 CSS、:has-text 等）。
+        失败后尝试 XPath（以 // 或 xpath= 开头时）。
+        失败返回 None（不抛异常）。
+        """
+        if not selector:
+            return None
+
+        # XPath 支持
+        if selector.startswith("//") or selector.startswith("xpath="):
+            xpath = selector.replace("xpath=", "", 1)
+            try:
+                el = await page.wait_for_selector(f"xpath={xpath}", state=state, timeout=timeout)
+                return el
+            except Exception:
+                return None
+
+        # CSS / Playwright 伪选择器
+        try:
+            el = await page.wait_for_selector(selector, state=state, timeout=timeout)
+            return el
+        except Exception:
+            pass
+
+        # 备选：get_by_role 尝试（从 :has-text 提取文本）
+        try:
+            if ":has-text(" in selector:
+                import re
+                match = re.search(r":has-text\(['\"](.+?)['\"]\)", selector)
+                if match:
+                    text = match.group(1)
+                    tag = re.match(r"(\w+)", selector)
+                    role_map = {"button": "button", "a": "link", "input": "textbox"}
+                    if tag:
+                        role = role_map.get(tag.group(1).lower())
+                        if role:
+                            el = await page.get_by_role(role, name=text).first
+                            try:
+                                await el.wait_for(state=state, timeout=timeout)
+                                return el
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+        return None
