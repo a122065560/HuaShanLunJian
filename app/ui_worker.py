@@ -72,6 +72,9 @@ class AIWorker:
                         self._monitoring = False
                         self._discussion_active = True
                         await self._handle_send(cmd)
+                        # 发送完成后如果 worker 已被停止，直接退出（不重建页面）
+                        if not self._running:
+                            break
                         self._monitoring = True
                         # 发送完成后不立即恢复检测，延迟5秒避免页面重渲染导致波动
                         await asyncio.sleep(5)
@@ -82,7 +85,7 @@ class AIWorker:
                     pass
 
                 # 监控状态
-                if self._monitoring:
+                if self._monitoring and self._running:
                     await self._check_status()
 
                 await asyncio.sleep(1)  # 1秒轮询，体验优先
@@ -91,6 +94,14 @@ class AIWorker:
             log_error(f"[AIWorker:{self.name}] 异常: {e}")
             await self.brain_queue.put(("error", self.name, str(e)))
         finally:
+            # 兜底关闭页面：确保 AIWorker 退出时网页也被关闭
+            # 即使 close_page 已通过 URL 匹配关闭过，这里再次 close 也不会出错（Playwright 幂等）
+            if self.page is not None:
+                try:
+                    await self.page.close()
+                    log_info(f"[AIWorker:{self.name}] 页面已关闭")
+                except Exception as e:
+                    log_warning(f"[AIWorker:{self.name}] 关闭页面失败（可能已关闭）: {e}")
             log_info(f"[AIWorker:{self.name}] 已停止")
 
     async def _check_status(self):
@@ -102,6 +113,10 @@ class AIWorker:
         """
         # 讨论进行中时，已绿色的AI不再反复检测（防止波动）
         if self._discussion_active and self._last_status == "green":
+            return
+
+        # worker 已停止时不再检测/重建页面
+        if not self._running:
             return
 
         # 检查页面是否已失效，尝试重建

@@ -42,7 +42,7 @@ _migrate_legacy_config()
 
 # 默认配置版本号（每次修改 DEFAULT_CONFIG 中的选择器/思考模式时递增）
 # 用于判断用户配置是否需要同步更新默认平台的配置
-DEFAULT_CONFIG_VERSION = 9
+DEFAULT_CONFIG_VERSION = 10
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -248,9 +248,9 @@ DEFAULT_CONFIG = {
                 "stop_button": "button:has-text('停止'), div[class*='stop']",
                 "response_container": "div[class*='message'], div[class*='conversation'], div[class*='bubble'], div[class*='answer'], div[class*='response']",
                 "last_response": "div[class*='markdown']:not([class*='think']):not([class*='reasoning']):last-of-type, div[class*='message-content']:not([class*='think']):last-of-type, div[class*='bubble']:not([class*='think']):last-of-type, div[class*='prose']:not([class*='think']):last-of-type",
-                "logged_in_selector": "div[class*='avatar'], img[class*='avatar'], button[class*='avatar']",
-                "logged_out_selector": "button:has-text('登录'), button.login-btn-header-CTKsn1",
-                "auth_storage_keys": ["sessionid", "uid", "sid_tt", "uid_tt", "passport_csrf_token", "samantha_web_web_id"],
+                "logged_in_selector": "[data-slot='dropdown-menu-trigger'], img[src*='byteacctimg.com'], img[src*='user-avatar'], span.text-dbx-text-primary",
+                "logged_out_selector": "button.login-btn-header-CTKsn1",
+                "auth_storage_keys": ["sessionid", "uid", "sid_tt", "uid_tt", "passport_csrf_token", "samantha_web_web_id", "passport_auth_status", "n_mh"],
             },
             "thinking_mode": {
                 "enabled": False,

@@ -901,6 +901,9 @@ class ChromeManager:
         """
         关闭已打开的指定 URL 的页面。
 
+        使用与 get_or_create_page 相同的 _url_matches_with_redirect 匹配策略
+        （域名级匹配 + 重定向缓存），确保跨域重定向后仍能正确找到并关闭页面。
+
         Args:
             url: 目标 AI 平台 URL
 
@@ -914,9 +917,9 @@ class ChromeManager:
             if self._context is not None:
                 for page in self._context.pages:
                     try:
-                        if url in page.url:
+                        if self._url_matches_with_redirect(url, page.url):
                             await page.close()
-                            log_info(f"已关闭页面: {url}")
+                            log_info(f"已关闭页面: {url} (实际: {page.url})")
                             closed = True
                     except Exception:
                         continue
@@ -927,9 +930,9 @@ class ChromeManager:
             for context in browser.contexts:
                 for page in context.pages:
                     try:
-                        if url in page.url:
+                        if self._url_matches_with_redirect(url, page.url):
                             await page.close()
-                            log_info(f"已关闭页面: {url}")
+                            log_info(f"已关闭页面: {url} (实际: {page.url})")
                             closed = True
                     except Exception:
                         continue
@@ -2395,6 +2398,11 @@ class ChromeManager:
                     found.push(el);
                 }
             });
+            // 策略3b: data-icon-type 含"copy"（千问等平台用 data-icon-type="qwpcicon-copy"）
+            document.querySelectorAll('[data-icon-type*="copy" i]').forEach(el => {
+                const btn = el.closest('button, [role="button"], [data-state="closed"]') || el;
+                found.push(btn);
+            });
             // 策略4: 回复区块底部工具栏的第一个按钮
             const footerSelectors = [
                 '.ds-markdown--footer',
@@ -2406,11 +2414,13 @@ class ChromeManager:
                 '[class*="msg-action"]',
                 '[class*="reply-action"]',
                 '[class*="footer-action"]',
+                '[data-answer-feedback-toolbar]',  // 千问：data-answer-feedback-toolbar="true"
             ];
             footerSelectors.forEach(sel => {
                 try {
                     document.querySelectorAll(sel).forEach(bar => {
-                        const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"]');
+                        // 扩展搜索范围：button + role=button + data-state=closed 的div（千问复制按钮是div）
+                        const btns = bar.querySelectorAll('button, [role="button"], [data-dbx-name="button"], div[data-state="closed"]');
                         if (btns.length > 0) {
                             for (const btn of btns) {
                                 const aria = (btn.getAttribute('aria-label') || '').trim();
@@ -2455,6 +2465,7 @@ class ChromeManager:
                     'div[class*="bubble"]:not([class*="think"])',
                     'div[data-role="assistant"]',
                     'div[class*="prose"]',
+                    '.qk-markdown',  // 千问：qk-markdown qk-markdown-react
                 ];
                 let el = lastBtn;
                 for (let i = 0; i < 15; i++) {
@@ -3630,7 +3641,8 @@ class ChromeManager:
                     const rect = el.getBoundingClientRect();
                     if (rect.width <= 0 || rect.height <= 0) return false;
                     const style = window.getComputedStyle(el);
-                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+                    if (parseFloat(style.opacity) === 0) return false;
                     return true;
                 }
 
