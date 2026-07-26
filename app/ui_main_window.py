@@ -607,7 +607,6 @@ class SettingsDialog(QDialog):
 
         info_items = [
             ("👤 开发者", "Damon"),
-            ("📧 邮箱", "122065560@qq.com"),
             ("📂 GitHub", '<a href="https://github.com/a122065560/HuaShanLunJian" style="color:#007AFF;text-decoration:none;">github.com/a122065560/HuaShanLunJian</a>'),
         ]
         for icon, val in info_items:
